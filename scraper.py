@@ -22,7 +22,7 @@ from playwright.sync_api import (
 
 PLAYWRIGHT_CONFIG = {
     "headless": True,
-    "timeout": 30_000,
+    "timeout": 60_000,
     "viewport": {"width": 1280, "height": 800},
     "locale": "ru-RU",
 }
@@ -34,7 +34,7 @@ REGISTRY_URL = f"{BASE_URL}/ru/registry/contract"
 # 190 = Действует, 460 = Передан.Действует, 450 = Создано доп.соглашение
 TARGET_STATUS_VALUES = ["190", "460", "450"]
 
-REQUEST_DELAY = 1.5
+REQUEST_DELAY = 2.5
 RETRY_COUNT   = 2
 
 logger = logging.getLogger(__name__)
@@ -341,7 +341,20 @@ def scrape_bin(
             if progress_cb:
                 progress_cb(idx, total, f"Договор {idx} из {total}")
 
-            record = parse_contract(page, url, bin_number)
+            try:
+                record = parse_contract(page, url, bin_number)
+            except Exception as exc:
+                logger.error("Необработанная ошибка договора %s: %s", url, exc)
+                record = ContractRecord(
+                    bin=bin_number,
+                    description="",
+                    amount_procurement=0.0,
+                    amount_final=0.0,
+                    difference=0.0,
+                    url=url,
+                    error=f"Критическая ошибка: {exc}",
+                )
+
             result.records.append(record)
 
             if record.error:
