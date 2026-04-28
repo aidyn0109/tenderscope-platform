@@ -1,9 +1,12 @@
 services:
   - type: web
-    name: tenderscope
+    name: tendescope
     runtime: python
-    buildCommand: pip install -r requirements.txt && playwright install chromium && playwright install-deps chromium
+    buildCommand: pip install -r requirements.txt && playwright install chromium
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.0
+      - key: PLAYWRIGHT_BROWSERS_PATH
+        value: /opt/render/project/.playwright-browsers
+    nativeEnvironmentVariables:
+      - key: PYTHONUNBUFFERED
+        value: "1"
