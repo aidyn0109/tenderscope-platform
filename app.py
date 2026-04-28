@@ -307,6 +307,7 @@ if st.session_state.running:
             except Exception as exc:
                 log.exception("Ошибка Excel: %s", exc)
 
+        st.session_state.worker_error = error
         st.session_state.results     = results
         st.session_state.excel_bytes = excel_bytes
         st.session_state.running     = False
@@ -338,7 +339,15 @@ if st.session_state.results is not None and not st.session_state.running:
     results: list[ScrapeResult] = st.session_state.results
 
     if not results:
-        st.error("❌ Данные не получены. Проверьте лог в терминале.")
+        worker_err = st.session_state.get("worker_error")
+        if worker_err:
+            st.error(f"❌ Ошибка: {worker_err}")
+        log_path = st.session_state.get("log_file_path")
+        if log_path and os.path.exists(log_path):
+            with open(log_path, encoding="utf-8") as f:
+                st.code(f.read()[-3000:], language="text")
+        else:
+            st.error("❌ Данные не получены.")
     else:
         st.success("✅ Анализ успешно завершён!")
         st.markdown("#### 📊 Результаты")
