@@ -23,7 +23,7 @@ from playwright.sync_api import (
 
 PLAYWRIGHT_CONFIG = {
     "headless": True,
-    "timeout": 60_000,
+    "timeout": 90_000,
     "viewport": {"width": 1280, "height": 800},
     "locale": "ru-RU",
     "user_agent": (
@@ -42,7 +42,7 @@ TARGET_STATUS_VALUES = ["190", "460", "450"]
 # Ресурсы, которые блокируем — не нужны для парсинга, экономят время
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
-REQUEST_DELAY = 0.8   # задержка между договорами (сек)
+REQUEST_DELAY = 0.3   # задержка между договорами (сек)
 RETRY_COUNT   = 2
 
 logger = logging.getLogger(__name__)
@@ -118,10 +118,19 @@ def _setup_page_routes(page: Page) -> None:
 def navigate_to_registry(page: Page) -> None:
     logger.info("Переходим на реестр договоров: %s", REGISTRY_URL)
     _setup_page_routes(page)
-    page.goto(REGISTRY_URL, wait_until="domcontentloaded",
-              timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(800)
-    logger.info("Реестр загружен. URL: %s", page.url)
+    for attempt in range(1, 4):
+        try:
+            page.goto(REGISTRY_URL, wait_until="domcontentloaded",
+                      timeout=PLAYWRIGHT_CONFIG["timeout"])
+            page.wait_for_timeout(600)
+            logger.info("Реестр загружен (попытка %d). URL: %s", attempt, page.url)
+            return
+        except Exception as exc:
+            logger.warning("navigate_to_registry попытка %d/3: %s", attempt, exc)
+            if attempt == 3:
+                raise
+            logger.info("Повтор через 5 сек...")
+            time.sleep(5)
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +143,7 @@ def apply_filters(page: Page, bin_number: str) -> None:
     supplier_input = page.locator("#in_supplier")
     supplier_input.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
     supplier_input.fill(bin_number)
-    page.wait_for_timeout(200)
+    page.wait_for_timeout(150)
 
     page.evaluate(
         """(values) => {
@@ -150,13 +159,13 @@ def apply_filters(page: Page, bin_number: str) -> None:
         }""",
         TARGET_STATUS_VALUES,
     )
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(200)
 
     search_btn = page.locator("button[type='submit']").first
     search_btn.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
     search_btn.click()
     page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(800)
+    page.wait_for_timeout(600)
 
     logger.info("Фильтры применены. URL: %s", page.url)
 
@@ -203,7 +212,7 @@ def collect_contract_links(page: Page) -> list[str]:
 
         next_li.locator("a").first.click()
         page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-        page.wait_for_timeout(800)
+        page.wait_for_timeout(500)
 
         first_anchor = page.locator("a[href*='/egzcontract/cpublic/show/']").first
         if first_anchor.count():
@@ -220,7 +229,7 @@ def collect_contract_links(page: Page) -> list[str]:
         if page_num > 100:
             break
 
-        _random_delay(0.5)
+        _random_delay(0.3)
 
     logger.info("Всего ссылок: %d", len(links))
     return links
@@ -230,48 +239,26 @@ def collect_contract_links(page: Page) -> list[str]:
 # Парсинг одного договора
 # ---------------------------------------------------------------------------
 
-def _extract_field_value(page: Page, label: str) -> str:
-    """
-    Извлекает значение поля по метке.
-    Структура страницы: <td width="40%">Метка</td><td>Значение</td>
-    """
-    value = page.evaluate(
-        """(label) => {
-            const tds = document.querySelectorAll("td");
-            for (const td of tds) {
-                if (td.innerText.trim() === label) {
-                    const next = td.nextElementSibling;
-                    if (next) return next.innerText.trim();
-                }
-            }
-            return "";
-        }""",
-        label,
-    )
-    if value:
-        return value
+# Все нужные поля в одном JS-запросе — единственный обход DOM вместо 5 отдельных
+_EXTRACT_JS = """(labels) => {
+    const result = {};
+    for (const td of document.querySelectorAll("td")) {
+        const text = td.innerText.trim();
+        if (labels.includes(text)) {
+            const next = td.nextElementSibling;
+            if (next) result[text] = next.innerText.trim();
+        }
+    }
+    return result;
+}"""
 
-    dd = page.locator(f"dt:has-text('{label}') + dd").first
-    if dd.count():
-        return dd.inner_text().strip()
-
-    row_td = page.locator(
-        f"th:has-text('{label}') + td, td:has-text('{label}') + td"
-    ).first
-    if row_td.count():
-        return row_td.inner_text().strip()
-
-    label_el = page.locator(f"label:has-text('{label}')").first
-    if label_el.count():
-        for_attr = label_el.get_attribute("for")
-        if for_attr:
-            el = page.locator(f"#{for_attr}").first
-            if el.count():
-                tag = el.evaluate("el => el.tagName.toLowerCase()")
-                return el.input_value().strip() if tag == "input" else el.inner_text().strip()
-
-    logger.debug("Поле «%s» не найдено", label)
-    return ""
+_CONTRACT_FIELDS = [
+    "Номер основного договора в реестре договоров",
+    "Краткое содержание договора на русском языке",
+    "Срок действия договора",
+    "Общая итоговая сумма договора",
+    "Общая фактическая сумма договора",
+]
 
 
 def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
@@ -279,39 +266,29 @@ def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
         try:
             page.goto(url, wait_until="domcontentloaded",
                       timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(500)
+            page.wait_for_timeout(150)
 
-            contract_number   = _extract_field_value(
-                page, "Номер основного договора в реестре договоров"
-            )
-            description       = _extract_field_value(
-                page, "Краткое содержание договора на русском языке"
-            )
-            validity_period   = _extract_field_value(
-                page, "Срок действия договора"
-            )
-            amount_str_final  = _extract_field_value(
-                page, "Общая итоговая сумма договора"
-            )
-            amount_str_actual = _extract_field_value(
-                page, "Общая фактическая сумма договора"
-            )
+            data = page.evaluate(_EXTRACT_JS, _CONTRACT_FIELDS)
+
+            contract_number   = data.get("Номер основного договора в реестре договоров", "")
+            description       = data.get("Краткое содержание договора на русском языке", "")
+            validity_period   = data.get("Срок действия договора", "")
+            amount_str_final  = data.get("Общая итоговая сумма договора", "")
+            amount_str_actual = data.get("Общая фактическая сумма договора", "")
 
             amount_final  = _parse_amount(amount_str_final)
             amount_actual = _parse_amount(amount_str_actual)
 
-            has_amounts = bool(amount_str_final and amount_str_actual)
-
             return ContractRecord(
                 bin=bin_number,
-                contract_number=contract_number or "",
+                contract_number=contract_number,
                 description=description or "(описание отсутствует)",
-                validity_period=validity_period or "",
+                validity_period=validity_period,
                 amount_final=amount_final,
                 amount_actual=amount_actual,
                 difference=round(amount_final - amount_actual, 2),
                 url=url,
-                error="" if has_amounts else "Сумма не найдена",
+                error="" if (amount_str_final and amount_str_actual) else "Сумма не найдена",
             )
 
         except Exception as exc:
@@ -328,7 +305,7 @@ def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
                     url=url,
                     error=f"Ошибка загрузки: {exc}",
                 )
-            time.sleep(1)
+            time.sleep(2)
 
 
 # ---------------------------------------------------------------------------
