@@ -392,10 +392,25 @@ def scrape_all(
             headless=PLAYWRIGHT_CONFIG["headless"],
             args=[
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",
+                # Безопасность / sandbox (обязательно на Render)
                 "--no-sandbox",
                 "--disable-setuid-sandbox",
+                # Память — самое важное для Render free tier (512MB)
+                "--disable-dev-shm-usage",   # не использовать /dev/shm (мало места)
+                "--disable-gpu",             # GPU не нужен в headless
+                "--no-zygote",               # убирает лишний форк-процесс
+                # Отключаем всё лишнее
                 "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-background-timer-throttling",
+                "--disable-client-side-phishing-detection",
+                "--disable-default-apps",
+                "--disable-hang-monitor",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--no-first-run",
+                "--safebrowsing-disable-auto-update",
             ],
         )
         context: BrowserContext = browser.new_context(

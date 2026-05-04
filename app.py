@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -57,18 +58,32 @@ def validate_bin(s: str) -> bool:
     return bool(re.fullmatch(r"\d{12}", s.strip()))
 
 
-def _stop_worker() -> None:
-    pid = st.session_state.get("worker_pid")
-    if pid:
-        try:
-            # taskkill /T убивает дерево процессов (включая Chromium)
+def _kill_worker_process(pid: int) -> None:
+    """Убивает воркер и все его дочерние процессы (включая Chromium)."""
+    try:
+        if os.name == "nt":
+            # Windows: taskkill /T убивает дерево процессов
             subprocess.call(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-        except Exception:
-            pass
+        else:
+            # Linux/Render: убиваем всю группу процессов через SIGKILL
+            # preexec_fn=os.setsid при запуске сделал воркер лидером группы
+            try:
+                pgid = os.getpgid(pid)
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass  # процесс уже завершён
+    except Exception as e:
+        log.warning("Ошибка при остановке воркера PID=%s: %s", pid, e)
+
+
+def _stop_worker() -> None:
+    pid = st.session_state.get("worker_pid")
+    if pid:
+        _kill_worker_process(pid)
     st.session_state.running    = False
     st.session_state.worker_pid = None
     st.session_state.results    = None
@@ -232,10 +247,18 @@ if not st.session_state.running and st.session_state.results is None:
             json.dump({"bins": filled, "progress_file": progress_file}, f, ensure_ascii=False)
 
         log_file = open(log_file_path, "w", encoding="utf-8")
+        popen_kwargs: dict = {
+            "stdout": log_file,
+            "stderr": sys.stderr,  # ошибки видны в Render-логах
+        }
+        if os.name != "nt":
+            # Linux: запускаем в новой группе процессов →
+            # при kill через os.killpg умирает весь Chromium вместе с воркером
+            popen_kwargs["preexec_fn"] = os.setsid
+
         proc = subprocess.Popen(
             [sys.executable, "-u", str(WORKER_PATH), input_file, output_file],
-            stdout=log_file,
-            stderr=log_file,
+            **popen_kwargs,
         )
         log.info("Воркер запущен PID=%d  tmp=%s", proc.pid, tmp_dir)
 
