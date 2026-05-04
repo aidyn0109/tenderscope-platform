@@ -92,11 +92,13 @@ def _records_to_results(records: list[dict]) -> list[ScrapeResult]:
             by_bin[b] = ScrapeResult(bin=b)
         cr = ContractRecord(
             bin=r["bin"],
-            description=r["description"],
-            amount_procurement=r["amount_procurement"],
-            amount_final=r["amount_final"],
-            difference=r["difference"],
-            url=r["url"],
+            contract_number=r.get("contract_number", ""),
+            description=r.get("description", ""),
+            validity_period=r.get("validity_period", ""),
+            amount_final=r.get("amount_final", 0.0),
+            amount_actual=r.get("amount_actual", 0.0),
+            difference=r.get("difference", 0.0),
+            url=r.get("url", ""),
             error=r.get("error", ""),
         )
         by_bin[b].records.append(cr)
@@ -366,10 +368,8 @@ if st.session_state.results is not None and not st.session_state.running:
         st.divider()
 
         for result in results:
-            bin_diff  = sum(
-                rec.difference for rec in result.records
-                if not rec.error or rec.error == "Сумма не найдена"
-            )
+            valid = [r for r in result.records if not r.error or r.error == "Сумма не найдена"]
+            bin_diff  = sum(rec.difference for rec in valid)
             err_count = sum(
                 1 for rec in result.records
                 if rec.error and rec.error != "Сумма не найдена"
@@ -381,13 +381,16 @@ if st.session_state.results is not None and not st.session_state.running:
                 if err_count:
                     st.warning(f"⚠️ Ошибок при загрузке: {err_count}")
                 for rec in result.records[:10]:
-                    icon     = "⚠️" if rec.error and rec.error != "Сумма не найдена" else "📄"
-                    diff_str = (
-                        f"{rec.difference:,.0f} ₸"
-                        if not rec.error or rec.error == "Сумма не найдена" else "—"
-                    )
+                    has_error = rec.error and rec.error != "Сумма не найдена"
+                    icon      = "⚠️" if has_error else "📄"
+                    diff_str  = f"{rec.difference:,.0f} ₸" if not has_error else "—"
+                    num_part  = f" №{rec.contract_number}" if rec.contract_number else ""
                     st.markdown(
-                        f"{icon} **{rec.description[:80]}**  \nРазница: `{diff_str}`"
+                        f"{icon} **{rec.description[:80]}**{num_part}  \n"
+                        f"Срок: `{rec.validity_period or '—'}` | "
+                        f"Итог: `{rec.amount_final:,.0f} ₸` | "
+                        f"Факт: `{rec.amount_actual:,.0f} ₸` | "
+                        f"Разница: `{diff_str}`"
                         + (f"  — [{rec.url}]({rec.url})" if rec.url else "")
                     )
                 if len(result.records) > 10:

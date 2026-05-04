@@ -74,13 +74,15 @@ def _run(bins: list[str], progress_file: str) -> list[dict]:
     for sr in results:
         for rec in sr.records:
             records.append({
-                "bin":                rec.bin,
-                "description":        rec.description,
-                "amount_procurement": rec.amount_procurement,
-                "amount_final":       rec.amount_final,
-                "difference":         rec.difference,
-                "url":                rec.url,
-                "error":              rec.error,
+                "bin":             rec.bin,
+                "contract_number": rec.contract_number,
+                "description":     rec.description,
+                "validity_period": rec.validity_period,
+                "amount_final":    rec.amount_final,
+                "amount_actual":   rec.amount_actual,
+                "difference":      rec.difference,
+                "url":             rec.url,
+                "error":           rec.error,
             })
 
     return records, progress

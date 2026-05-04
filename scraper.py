@@ -4,8 +4,11 @@ scraper.py — Логика парсинга goszakup.gov.kz
 """
 
 import logging
+import random
 import re
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -25,17 +28,25 @@ PLAYWRIGHT_CONFIG = {
     "timeout": 60_000,
     "viewport": {"width": 1280, "height": 800},
     "locale": "ru-RU",
+    "user_agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
 }
 
 BASE_URL     = "https://goszakup.gov.kz"
 REGISTRY_URL = f"{BASE_URL}/ru/registry/contract"
 
-# Реальные значения статусов из select на сайте:
 # 190 = Действует, 460 = Передан.Действует, 450 = Создано доп.соглашение
 TARGET_STATUS_VALUES = ["190", "460", "450"]
 
-REQUEST_DELAY = 2.5
-RETRY_COUNT   = 2
+# Ресурсы, которые блокируем — не нужны для парсинга, экономят время
+BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
+
+REQUEST_DELAY   = 0.8   # задержка между договорами (сек)
+RETRY_COUNT     = 2
+MAX_PARALLEL    = 3     # параллельных страниц при парсинге договоров
 
 logger = logging.getLogger(__name__)
 
@@ -46,13 +57,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class ContractRecord:
-    bin:                str
-    description:        str
-    amount_procurement: float
-    amount_final:       float
-    difference:         float
-    url:                str
-    error:              str = ""
+    bin:             str
+    contract_number: str    # Номер основного договора в реестре договоров
+    description:     str    # Краткое содержание договора на русском языке
+    validity_period: str    # Срок действия договора
+    amount_final:    float  # Общая итоговая сумма договора
+    amount_actual:   float  # Общая фактическая сумма договора
+    difference:      float  # amount_final - amount_actual
+    url:             str
+    error:           str = ""
 
 
 @dataclass
@@ -74,7 +87,6 @@ def _parse_amount(raw: str) -> float:
         return 0.0
     cleaned = re.sub(r"[^\d,\.]", "", raw.replace("\xa0", "").replace(" ", ""))
     cleaned = cleaned.replace(",", ".")
-    # Убираем лишние точки (1.234.567 → 1234567)
     parts = cleaned.split(".")
     if len(parts) > 2:
         cleaned = "".join(parts[:-1]) + "." + parts[-1]
@@ -85,15 +97,33 @@ def _parse_amount(raw: str) -> float:
         return 0.0
 
 
+def _random_delay(base: float = REQUEST_DELAY) -> None:
+    """Случайная задержка ±30% от base для имитации человека."""
+    time.sleep(base * random.uniform(0.7, 1.3))
+
+
+def _setup_page_routes(page: Page) -> None:
+    """Блокирует ненужные ресурсы для ускорения загрузки."""
+    page.route(
+        "**/*",
+        lambda route: (
+            route.abort()
+            if route.request.resource_type in BLOCKED_RESOURCE_TYPES
+            else route.continue_()
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Навигация к реестру договоров
 # ---------------------------------------------------------------------------
 
 def navigate_to_registry(page: Page) -> None:
     logger.info("Переходим на реестр договоров: %s", REGISTRY_URL)
+    _setup_page_routes(page)
     page.goto(REGISTRY_URL, wait_until="domcontentloaded",
               timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(1_500)
+    page.wait_for_timeout(800)
     logger.info("Реестр загружен. URL: %s", page.url)
 
 
@@ -104,13 +134,11 @@ def navigate_to_registry(page: Page) -> None:
 def apply_filters(page: Page, bin_number: str) -> None:
     logger.info("Применяем фильтры для БИН: %s", bin_number)
 
-    # Поле поставщика: id="in_supplier"
     supplier_input = page.locator("#in_supplier")
     supplier_input.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
     supplier_input.fill(bin_number)
-    page.wait_for_timeout(300)
+    page.wait_for_timeout(200)
 
-    # Статусы через Select2 / jQuery (select name="filter[status][]")
     page.evaluate(
         """(values) => {
             const sel = document.querySelector("select[name='filter[status][]']");
@@ -118,7 +146,6 @@ def apply_filters(page: Page, bin_number: str) -> None:
             if (window.jQuery) {
                 jQuery(sel).val(values).trigger('change');
             } else {
-                // Fallback: выбираем нужные options напрямую
                 Array.from(sel.options).forEach(opt => {
                     opt.selected = values.includes(opt.value);
                 });
@@ -126,14 +153,13 @@ def apply_filters(page: Page, bin_number: str) -> None:
         }""",
         TARGET_STATUS_VALUES,
     )
-    page.wait_for_timeout(500)
+    page.wait_for_timeout(300)
 
-    # Кнопка «Найти» (submit)
     search_btn = page.locator("button[type='submit']").first
     search_btn.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
     search_btn.click()
     page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(1_000)
+    page.wait_for_timeout(800)
 
     logger.info("Фильтры применены. URL: %s", page.url)
 
@@ -143,18 +169,14 @@ def apply_filters(page: Page, bin_number: str) -> None:
 # ---------------------------------------------------------------------------
 
 def collect_contract_links(page: Page) -> list[str]:
-    """
-    Собирает ссылки вида /egzcontract/cpublic/show/{id} со всех страниц.
-    Пагинация: кнопка '»' в .pagination (Bootstrap), проверяем disabled-класс.
-    """
     links: list[str] = []
     page_num = 1
 
     while True:
         logger.info("Сбор ссылок — страница %d", page_num)
 
-        anchors = page.locator("a[href*='/egzcontract/cpublic/show/']")
-        count   = anchors.count()
+        anchors  = page.locator("a[href*='/egzcontract/cpublic/show/']")
+        count    = anchors.count()
         new_count = 0
 
         for i in range(count):
@@ -168,9 +190,8 @@ def collect_contract_links(page: Page) -> list[str]:
         logger.info("Страница %d: %d новых ссылок (всего: %d)", page_num, new_count, len(links))
 
         if new_count == 0:
-            break  # Нет новых ссылок — выходим
+            break
 
-        # Проверяем кнопку «следующая страница»
         next_li = page.locator(".pagination li").filter(has_text="»").first
         if not next_li.count():
             break
@@ -181,14 +202,12 @@ def collect_contract_links(page: Page) -> list[str]:
         if is_disabled:
             break
 
-        # Запоминаем первую ссылку текущей страницы
         first_href_before = links[-(new_count)] if new_count else None
 
         next_li.locator("a").first.click()
         page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-        page.wait_for_timeout(1_000)
+        page.wait_for_timeout(800)
 
-        # Проверяем, что страница реально сменилась
         first_anchor = page.locator("a[href*='/egzcontract/cpublic/show/']").first
         if first_anchor.count():
             first_href_after = first_anchor.get_attribute("href")
@@ -196,15 +215,15 @@ def collect_contract_links(page: Page) -> list[str]:
                 first_href_after == first_href_before
                 or first_href_after in links
             ):
-                break  # Страница не изменилась
+                break
         else:
             break
 
         page_num += 1
-        if page_num > 100:  # Защита от бесконечного цикла
+        if page_num > 100:
             break
 
-        time.sleep(REQUEST_DELAY)
+        _random_delay(0.5)
 
     logger.info("Всего ссылок: %d", len(links))
     return links
@@ -216,10 +235,9 @@ def collect_contract_links(page: Page) -> list[str]:
 
 def _extract_field_value(page: Page, label: str) -> str:
     """
-    Извлекает значение поля с сайта.
+    Извлекает значение поля по метке.
     Структура страницы: <td width="40%">Метка</td><td>Значение</td>
     """
-    # Стратегия 1: td с точным текстом метки → следующий td (основная структура сайта)
     value = page.evaluate(
         """(label) => {
             const tds = document.querySelectorAll("td");
@@ -236,19 +254,16 @@ def _extract_field_value(page: Page, label: str) -> str:
     if value:
         return value
 
-    # Стратегия 2: dt → dd
     dd = page.locator(f"dt:has-text('{label}') + dd").first
     if dd.count():
         return dd.inner_text().strip()
 
-    # Стратегия 3: th → td
     row_td = page.locator(
         f"th:has-text('{label}') + td, td:has-text('{label}') + td"
     ).first
     if row_td.count():
         return row_td.inner_text().strip()
 
-    # Стратегия 4: label → связанный элемент
     label_el = page.locator(f"label:has-text('{label}')").first
     if label_el.count():
         for_attr = label_el.get_attribute("for")
@@ -267,29 +282,39 @@ def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
         try:
             page.goto(url, wait_until="domcontentloaded",
                       timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(800)
+            page.wait_for_timeout(500)
 
-            description      = _extract_field_value(
+            contract_number   = _extract_field_value(
+                page, "Номер основного договора в реестре договоров"
+            )
+            description       = _extract_field_value(
                 page, "Краткое содержание договора на русском языке"
             )
-            amount_str_proc  = _extract_field_value(
-                page, "Общая сумма договора по итогам закупки"
+            validity_period   = _extract_field_value(
+                page, "Срок действия договора"
             )
-            amount_str_final = _extract_field_value(
+            amount_str_final  = _extract_field_value(
                 page, "Общая итоговая сумма договора"
             )
+            amount_str_actual = _extract_field_value(
+                page, "Общая фактическая сумма договора"
+            )
 
-            amount_proc  = _parse_amount(amount_str_proc)
-            amount_final = _parse_amount(amount_str_final)
+            amount_final  = _parse_amount(amount_str_final)
+            amount_actual = _parse_amount(amount_str_actual)
+
+            has_amounts = bool(amount_str_final and amount_str_actual)
 
             return ContractRecord(
                 bin=bin_number,
+                contract_number=contract_number or "",
                 description=description or "(описание отсутствует)",
-                amount_procurement=amount_proc,
+                validity_period=validity_period or "",
                 amount_final=amount_final,
-                difference=round(amount_proc - amount_final, 2),
+                amount_actual=amount_actual,
+                difference=round(amount_final - amount_actual, 2),
                 url=url,
-                error="" if (amount_str_proc and amount_str_final) else "Сумма не найдена",
+                error="" if has_amounts else "Сумма не найдена",
             )
 
         except Exception as exc:
@@ -297,14 +322,81 @@ def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
             if attempt > RETRY_COUNT:
                 return ContractRecord(
                     bin=bin_number,
+                    contract_number="",
                     description="",
-                    amount_procurement=0.0,
+                    validity_period="",
                     amount_final=0.0,
+                    amount_actual=0.0,
                     difference=0.0,
                     url=url,
                     error=f"Ошибка загрузки: {exc}",
                 )
-            time.sleep(2)
+            time.sleep(1)
+
+
+# ---------------------------------------------------------------------------
+# Параллельный парсинг договоров
+# ---------------------------------------------------------------------------
+
+def _parse_contracts_parallel(
+    context: BrowserContext,
+    links: list[str],
+    bin_number: str,
+    progress_cb: ProgressCallback | None = None,
+    max_workers: int = MAX_PARALLEL,
+) -> list[ContractRecord]:
+    """
+    Параллельно парсит список договоров.
+    Каждый поток создаёт свою страницу внутри общего контекста.
+    """
+    results: dict[int, ContractRecord] = {}
+    completed = [0]
+    lock = threading.Lock()
+
+    def _worker(args: tuple[int, str]) -> tuple[int, ContractRecord]:
+        idx, url = args
+        page = context.new_page()
+        _setup_page_routes(page)
+        try:
+            record = parse_contract(page, url, bin_number)
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+
+        with lock:
+            completed[0] += 1
+            done = completed[0]
+            if progress_cb:
+                progress_cb(done, len(links), f"Договор {done} из {len(links)}")
+
+        # Небольшая случайная задержка между запросами
+        _random_delay(REQUEST_DELAY)
+        return idx, record
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_worker, (i, url)): i for i, url in enumerate(links)}
+        for future in as_completed(futures):
+            try:
+                idx, record = future.result()
+                results[idx] = record
+            except Exception as exc:
+                idx = futures[future]
+                logger.error("Поток для индекса %d завершился с ошибкой: %s", idx, exc)
+                results[idx] = ContractRecord(
+                    bin=bin_number,
+                    contract_number="",
+                    description="",
+                    validity_period="",
+                    amount_final=0.0,
+                    amount_actual=0.0,
+                    difference=0.0,
+                    url=links[idx],
+                    error=f"Критическая ошибка потока: {exc}",
+                )
+
+    return [results[i] for i in range(len(links))]
 
 
 # ---------------------------------------------------------------------------
@@ -318,55 +410,48 @@ def scrape_bin(
 ) -> ScrapeResult:
     result = ScrapeResult(bin=bin_number)
     page   = context.new_page()
+    _setup_page_routes(page)
 
     try:
         navigate_to_registry(page)
         apply_filters(page, bin_number)
         links = collect_contract_links(page)
+        page.close()
 
         if not links:
             result.records.append(ContractRecord(
                 bin=bin_number,
+                contract_number="",
                 description="Договоры не найдены",
-                amount_procurement=0.0,
+                validity_period="",
                 amount_final=0.0,
+                amount_actual=0.0,
                 difference=0.0,
                 url="",
                 error="Договоры не найдены",
             ))
             return result
 
-        total = len(links)
-        for idx, url in enumerate(links, start=1):
-            if progress_cb:
-                progress_cb(idx, total, f"Договор {idx} из {total}")
+        records = _parse_contracts_parallel(
+            context=context,
+            links=links,
+            bin_number=bin_number,
+            progress_cb=progress_cb,
+            max_workers=MAX_PARALLEL,
+        )
 
-            try:
-                record = parse_contract(page, url, bin_number)
-            except Exception as exc:
-                logger.error("Необработанная ошибка договора %s: %s", url, exc)
-                record = ContractRecord(
-                    bin=bin_number,
-                    description="",
-                    amount_procurement=0.0,
-                    amount_final=0.0,
-                    difference=0.0,
-                    url=url,
-                    error=f"Критическая ошибка: {exc}",
-                )
-
+        for record in records:
             result.records.append(record)
-
             if record.error:
-                result.errors.append(f"{url}: {record.error}")
-
-            time.sleep(REQUEST_DELAY)
+                result.errors.append(f"{record.url}: {record.error}")
 
     except Exception as exc:
         logger.error("Критическая ошибка при обработке БИН %s: %s", bin_number, exc)
         result.errors.append(str(exc))
-    finally:
-        page.close()
+        try:
+            page.close()
+        except Exception:
+            pass
 
     return result
 
@@ -385,10 +470,25 @@ def scrape_all(
     with sync_playwright() as pw:
         browser: Browser = pw.chromium.launch(
             headless=PLAYWRIGHT_CONFIG["headless"],
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-extensions",
+            ],
         )
         context: BrowserContext = browser.new_context(
             viewport=PLAYWRIGHT_CONFIG["viewport"],
             locale=PLAYWRIGHT_CONFIG["locale"],
+            user_agent=PLAYWRIGHT_CONFIG["user_agent"],
+            extra_http_headers={
+                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept": (
+                    "text/html,application/xhtml+xml,application/xml;"
+                    "q=0.9,image/webp,*/*;q=0.8"
+                ),
+            },
         )
         context.set_default_timeout(PLAYWRIGHT_CONFIG["timeout"])
 
@@ -430,6 +530,10 @@ if __name__ == "__main__":
     for res in results:
         print(f"\n=== БИН {res.bin}: {len(res.records)} договоров ===")
         for rec in res.records[:5]:
-            print(f"  {rec.description[:60]:60s} | разница: {rec.difference:,.2f} ₸")
+            print(
+                f"  №{rec.contract_number} | {rec.description[:50]:50s} "
+                f"| итог: {rec.amount_final:,.0f} | факт: {rec.amount_actual:,.0f} "
+                f"| разница: {rec.difference:,.2f} ₸"
+            )
         if res.errors:
             print(f"  Ошибок: {len(res.errors)}")
