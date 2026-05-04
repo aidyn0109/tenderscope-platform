@@ -6,9 +6,7 @@ scraper.py — Логика парсинга goszakup.gov.kz
 import logging
 import random
 import re
-import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -44,9 +42,8 @@ TARGET_STATUS_VALUES = ["190", "460", "450"]
 # Ресурсы, которые блокируем — не нужны для парсинга, экономят время
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
-REQUEST_DELAY   = 0.8   # задержка между договорами (сек)
-RETRY_COUNT     = 2
-MAX_PARALLEL    = 3     # параллельных страниц при парсинге договоров
+REQUEST_DELAY = 0.8   # задержка между договорами (сек)
+RETRY_COUNT   = 2
 
 logger = logging.getLogger(__name__)
 
@@ -335,72 +332,7 @@ def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
 
 
 # ---------------------------------------------------------------------------
-# Параллельный парсинг договоров
-# ---------------------------------------------------------------------------
-
-def _parse_contracts_parallel(
-    context: BrowserContext,
-    links: list[str],
-    bin_number: str,
-    progress_cb: ProgressCallback | None = None,
-    max_workers: int = MAX_PARALLEL,
-) -> list[ContractRecord]:
-    """
-    Параллельно парсит список договоров.
-    Каждый поток создаёт свою страницу внутри общего контекста.
-    """
-    results: dict[int, ContractRecord] = {}
-    completed = [0]
-    lock = threading.Lock()
-
-    def _worker(args: tuple[int, str]) -> tuple[int, ContractRecord]:
-        idx, url = args
-        page = context.new_page()
-        _setup_page_routes(page)
-        try:
-            record = parse_contract(page, url, bin_number)
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
-
-        with lock:
-            completed[0] += 1
-            done = completed[0]
-            if progress_cb:
-                progress_cb(done, len(links), f"Договор {done} из {len(links)}")
-
-        # Небольшая случайная задержка между запросами
-        _random_delay(REQUEST_DELAY)
-        return idx, record
-
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_worker, (i, url)): i for i, url in enumerate(links)}
-        for future in as_completed(futures):
-            try:
-                idx, record = future.result()
-                results[idx] = record
-            except Exception as exc:
-                idx = futures[future]
-                logger.error("Поток для индекса %d завершился с ошибкой: %s", idx, exc)
-                results[idx] = ContractRecord(
-                    bin=bin_number,
-                    contract_number="",
-                    description="",
-                    validity_period="",
-                    amount_final=0.0,
-                    amount_actual=0.0,
-                    difference=0.0,
-                    url=links[idx],
-                    error=f"Критическая ошибка потока: {exc}",
-                )
-
-    return [results[i] for i in range(len(links))]
-
-
-# ---------------------------------------------------------------------------
-# Парсинг одного БИН
+# Парсинг одного БИН (sequential — Playwright sync API не thread-safe)
 # ---------------------------------------------------------------------------
 
 def scrape_bin(
@@ -416,7 +348,6 @@ def scrape_bin(
         navigate_to_registry(page)
         apply_filters(page, bin_number)
         links = collect_contract_links(page)
-        page.close()
 
         if not links:
             result.records.append(ContractRecord(
@@ -432,26 +363,38 @@ def scrape_bin(
             ))
             return result
 
-        records = _parse_contracts_parallel(
-            context=context,
-            links=links,
-            bin_number=bin_number,
-            progress_cb=progress_cb,
-            max_workers=MAX_PARALLEL,
-        )
+        total = len(links)
+        for idx, url in enumerate(links, start=1):
+            if progress_cb:
+                progress_cb(idx, total, f"Договор {idx} из {total}")
 
-        for record in records:
+            try:
+                record = parse_contract(page, url, bin_number)
+            except Exception as exc:
+                logger.error("Необработанная ошибка договора %s: %s", url, exc)
+                record = ContractRecord(
+                    bin=bin_number,
+                    contract_number="",
+                    description="",
+                    validity_period="",
+                    amount_final=0.0,
+                    amount_actual=0.0,
+                    difference=0.0,
+                    url=url,
+                    error=f"Критическая ошибка: {exc}",
+                )
+
             result.records.append(record)
             if record.error:
-                result.errors.append(f"{record.url}: {record.error}")
+                result.errors.append(f"{url}: {record.error}")
+
+            _random_delay(REQUEST_DELAY)
 
     except Exception as exc:
         logger.error("Критическая ошибка при обработке БИН %s: %s", bin_number, exc)
         result.errors.append(str(exc))
-        try:
-            page.close()
-        except Exception:
-            pass
+    finally:
+        page.close()
 
     return result
 

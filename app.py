@@ -296,8 +296,20 @@ if st.session_state.running:
         try:
             data    = _read_json(output_file)
             error   = data.get("error")
-            results = _records_to_results(data.get("records", []))
-            log.info("Загружено %d записей", sum(len(r.records) for r in results))
+            all_recs = data.get("records", [])
+            results = _records_to_results(all_recs)
+            total_loaded = sum(len(r.records) for r in results)
+            log.info("Загружено %d записей", total_loaded)
+
+            # Выводим ошибки парсинга в лог Render для диагностики
+            err_recs = [r for r in all_recs if r.get("error") and r.get("error") != "Сумма не найдена"]
+            if err_recs:
+                log.warning("Ошибок при парсинге: %d из %d", len(err_recs), total_loaded)
+                for r in err_recs[:30]:
+                    log.warning("  БИН %s | %s | %s",
+                                r.get("bin", "?"),
+                                r.get("url", "")[-70:],
+                                r.get("error", "?"))
         except Exception as exc:
             error = f"Ошибка чтения результата: {exc}"
             log.exception(error)
@@ -380,6 +392,11 @@ if st.session_state.results is not None and not st.session_state.running:
             ):
                 if err_count:
                     st.warning(f"⚠️ Ошибок при загрузке: {err_count}")
+                    with st.expander("Подробности ошибок"):
+                        for rec in result.records:
+                            if rec.error and rec.error != "Сумма не найдена":
+                                url_short = rec.url[-70:] if rec.url else "—"
+                                st.caption(f"🔗 `{url_short}`  \n❌ {rec.error}")
                 for rec in result.records[:10]:
                     has_error = rec.error and rec.error != "Сумма не найдена"
                     icon      = "⚠️" if has_error else "📄"
