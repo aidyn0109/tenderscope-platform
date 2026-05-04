@@ -73,6 +73,9 @@ class ScrapeResult:
 
 
 ProgressCallback = Callable[[int, int, str], None]
+RecordCallback   = Callable[["ContractRecord"], None]
+
+PAGE_RECYCLE_INTERVAL = 5  # Переоткрываем страницу каждые N договоров → освобождаем память
 
 
 # ---------------------------------------------------------------------------
@@ -316,37 +319,52 @@ def scrape_bin(
     bin_number: str,
     context: BrowserContext,
     progress_cb: ProgressCallback | None = None,
+    on_record: "RecordCallback | None" = None,
 ) -> ScrapeResult:
     result = ScrapeResult(bin=bin_number)
-    page   = context.new_page()
-    _setup_page_routes(page)
+
+    # Отдельная страница для навигации и сбора ссылок
+    nav_page = context.new_page()
+    _setup_page_routes(nav_page)
+    try:
+        navigate_to_registry(nav_page)
+        apply_filters(nav_page, bin_number)
+        links = collect_contract_links(nav_page)
+    finally:
+        nav_page.close()  # сразу освобождаем память навигационной страницы
+
+    if not links:
+        result.records.append(ContractRecord(
+            bin=bin_number,
+            contract_number="",
+            description="Договоры не найдены",
+            validity_period="",
+            amount_final=0.0,
+            amount_actual=0.0,
+            difference=0.0,
+            url="",
+            error="Договоры не найдены",
+        ))
+        return result
+
+    total        = len(links)
+    contract_page = context.new_page()
+    _setup_page_routes(contract_page)
 
     try:
-        navigate_to_registry(page)
-        apply_filters(page, bin_number)
-        links = collect_contract_links(page)
-
-        if not links:
-            result.records.append(ContractRecord(
-                bin=bin_number,
-                contract_number="",
-                description="Договоры не найдены",
-                validity_period="",
-                amount_final=0.0,
-                amount_actual=0.0,
-                difference=0.0,
-                url="",
-                error="Договоры не найдены",
-            ))
-            return result
-
-        total = len(links)
         for idx, url in enumerate(links, start=1):
             if progress_cb:
                 progress_cb(idx, total, f"Договор {idx} из {total}")
 
+            # Переоткрываем страницу каждые N договоров — очищаем накопленную память
+            if idx > 1 and (idx - 1) % PAGE_RECYCLE_INTERVAL == 0:
+                contract_page.close()
+                contract_page = context.new_page()
+                _setup_page_routes(contract_page)
+                logger.info("Страница переоткрыта после договора %d", idx - 1)
+
             try:
-                record = parse_contract(page, url, bin_number)
+                record = parse_contract(contract_page, url, bin_number)
             except Exception as exc:
                 logger.error("Необработанная ошибка договора %s: %s", url, exc)
                 record = ContractRecord(
@@ -362,6 +380,13 @@ def scrape_bin(
                 )
 
             result.records.append(record)
+
+            if on_record:
+                try:
+                    on_record(record)  # немедленно сохраняем на диск
+                except Exception as exc:
+                    logger.warning("on_record callback error: %s", exc)
+
             if record.error:
                 result.errors.append(f"{url}: {record.error}")
 
@@ -371,7 +396,10 @@ def scrape_bin(
         logger.error("Критическая ошибка при обработке БИН %s: %s", bin_number, exc)
         result.errors.append(str(exc))
     finally:
-        page.close()
+        try:
+            contract_page.close()
+        except Exception:
+            pass
 
     return result
 
@@ -384,6 +412,7 @@ def scrape_all(
     bin_list: list[str],
     on_bin_start: Callable[[int, int, str], None] | None = None,
     on_contract_progress: ProgressCallback | None = None,
+    on_record: "RecordCallback | None" = None,
 ) -> list[ScrapeResult]:
     results: list[ScrapeResult] = []
 
@@ -434,7 +463,7 @@ def scrape_all(
                     on_bin_start(i, total_bins, bin_number)
 
                 logger.info("=== Обработка БИН %s (%d/%d) ===", bin_number, i, total_bins)
-                result = scrape_bin(bin_number, context, on_contract_progress)
+                result = scrape_bin(bin_number, context, on_contract_progress, on_record)
                 results.append(result)
 
         finally:

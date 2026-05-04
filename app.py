@@ -91,6 +91,21 @@ def _stop_worker() -> None:
 
 # ── Вспомогательные функции ───────────────────────────────────────────────
 
+def _is_worker_alive(pid: int | None) -> bool:
+    """Проверяет, жив ли процесс воркера (без отправки сигналов)."""
+    if not pid:
+        return False
+    try:
+        os.kill(pid, 0)  # signal 0 = только проверка существования
+        return True
+    except ProcessLookupError:
+        return False  # процесс не существует
+    except PermissionError:
+        return True   # существует, но нет прав (на практике не возникает)
+    except Exception:
+        return True   # неизвестная ошибка → считаем живым
+
+
 def _read_json(path: str) -> dict:
     try:
         with open(path, encoding="utf-8") as f:
@@ -358,6 +373,37 @@ if st.session_state.running:
         time.sleep(0.5)
         st.rerun()
 
+    elif not _is_worker_alive(st.session_state.get("worker_pid")):
+        # Воркер умер раньше времени (OOM или краш) — проверяем частичные данные
+        partial: list[dict] = []
+        if os.path.exists(output_file):
+            try:
+                partial = _read_json(output_file).get("records", [])
+            except Exception:
+                pass
+
+        if partial:
+            log.warning("Воркер завершился досрочно. Частичных записей: %d", len(partial))
+            results = _records_to_results(partial)
+            excel_bytes = None
+            try:
+                excel_bytes = build_excel_report(results)
+            except Exception as exc:
+                log.exception("Ошибка Excel (частичные данные): %s", exc)
+            st.session_state.results      = results
+            st.session_state.excel_bytes  = excel_bytes
+            st.session_state.worker_error = (
+                f"⚠️ Парсинг прерван досрочно — сервер нагружен. "
+                f"Сохранено {len(partial)} из ~{c_tot} договоров."
+            )
+        else:
+            log.error("Воркер завершился без данных")
+            st.session_state.results      = []
+            st.session_state.worker_error = "Воркер завершился неожиданно без данных."
+
+        st.session_state.running = False
+        st.rerun()
+
     elif time.time() - started_at > WORKER_TIMEOUT:
         st.error(f"❌ Превышено время ожидания ({WORKER_TIMEOUT // 60} мин). Проверьте интернет-соединение.")
         st.session_state.running = False
@@ -386,7 +432,14 @@ if st.session_state.results is not None and not st.session_state.running:
         else:
             st.error("❌ Данные не получены.")
     else:
-        st.success("✅ Анализ успешно завершён!")
+        worker_err = st.session_state.get("worker_error")
+        if worker_err and worker_err.startswith("⚠️"):
+            st.warning(worker_err)  # частичный результат — предупреждение
+        elif worker_err:
+            st.error(f"❌ {worker_err}")
+
+        if not worker_err:
+            st.success("✅ Анализ успешно завершён!")
         st.markdown("#### 📊 Результаты")
 
         total_contracts = sum(len(r.records) for r in results)

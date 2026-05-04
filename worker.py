@@ -8,8 +8,9 @@ worker.py — Автономный процесс парсинга.
   input:  {"bins": ["БИН1", "БИН2"], "progress_file": "path/to/prog.json"}
   output: {"records": [...], "error": null}
 
-ВАЖНО: done=True пишется в progress.json только ПОСЛЕ записи output.json,
-чтобы исключить race condition при чтении со стороны app.py.
+Ключевое свойство: output.json пишется ПОСЛЕ КАЖДОГО договора через on_record callback.
+Если воркер убьют (OOM), app.py найдёт частичные данные и покажет их пользователю.
+done=True пишется только после полного завершения.
 """
 
 import json
@@ -25,7 +26,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-from scraper import ScrapeResult, scrape_all
+from scraper import ContractRecord, ScrapeResult, scrape_all
 
 
 def _write_progress(path: str, data: dict) -> None:
@@ -38,19 +39,49 @@ def _write_progress(path: str, data: dict) -> None:
         pass
 
 
-def _run(bins: list[str], progress_file: str) -> list[dict]:
+def _write_output(path: str, records: list) -> None:
+    """Атомарная запись output.json — tmp→rename, чтобы app.py не прочитал обрезанный файл."""
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"records": records, "error": None}, f,
+                      ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        log.warning("Ошибка записи output: %s", e)
+
+
+def _rec_to_dict(rec: ContractRecord) -> dict:
+    return {
+        "bin":             rec.bin,
+        "contract_number": rec.contract_number,
+        "description":     rec.description,
+        "validity_period": rec.validity_period,
+        "amount_final":    rec.amount_final,
+        "amount_actual":   rec.amount_actual,
+        "difference":      rec.difference,
+        "url":             rec.url,
+        "error":           rec.error,
+    }
+
+
+def _run(bins: list[str], progress_file: str, output_file: str) -> tuple[list[dict], dict]:
     progress = {
-        "bin_current": 0,
-        "bin_total": len(bins),
-        "bin_name": "",
+        "bin_current":     0,
+        "bin_total":       len(bins),
+        "bin_name":        "",
         "contract_current": 0,
-        "contract_total": 0,
-        "message": "Запуск браузера...",
-        "done": False,
+        "contract_total":  0,
+        "message":         "Запуск браузера...",
+        "done":            False,
     }
     _write_progress(progress_file, progress)
 
-    def on_bin_start(cur, tot, name):
+    all_records: list[dict] = []
+    # Сразу создаём пустой output — app.py может читать в любой момент
+    _write_output(output_file, all_records)
+
+    def on_bin_start(cur: int, tot: int, name: str) -> None:
         log.info("БИН %s (%d/%d)", name, cur, tot)
         progress.update(
             bin_current=cur, bin_total=tot, bin_name=name,
@@ -59,33 +90,25 @@ def _run(bins: list[str], progress_file: str) -> list[dict]:
         )
         _write_progress(progress_file, progress)
 
-    def on_contract(cur, tot, msg):
+    def on_contract(cur: int, tot: int, msg: str) -> None:
         log.info("  договор %d/%d", cur, tot)
         progress.update(contract_current=cur, contract_total=tot, message=msg)
         _write_progress(progress_file, progress)
 
-    results: list[ScrapeResult] = scrape_all(
+    def on_record(rec: ContractRecord) -> None:
+        """Вызывается сразу после парсинга каждого договора — сохраняем на диск."""
+        all_records.append(_rec_to_dict(rec))
+        _write_output(output_file, all_records)
+        log.info("  сохранено %d записей", len(all_records))
+
+    scrape_all(
         bins,
         on_bin_start=on_bin_start,
         on_contract_progress=on_contract,
+        on_record=on_record,
     )
 
-    records = []
-    for sr in results:
-        for rec in sr.records:
-            records.append({
-                "bin":             rec.bin,
-                "contract_number": rec.contract_number,
-                "description":     rec.description,
-                "validity_period": rec.validity_period,
-                "amount_final":    rec.amount_final,
-                "amount_actual":   rec.amount_actual,
-                "difference":      rec.difference,
-                "url":             rec.url,
-                "error":           rec.error,
-            })
-
-    return records, progress
+    return all_records, progress
 
 
 def main() -> None:
@@ -105,24 +128,20 @@ def main() -> None:
     log.info("Старт. БИН: %s", bins)
 
     try:
-        records, progress = _run(bins, progress_file)
-        result = {"records": records, "error": None}
+        records, progress = _run(bins, progress_file, output_file)
+        # Финальная запись — фиксируем итоговый список (on_record уже писал частично)
+        _write_output(output_file, records)
+        log.info("Результат финализирован: %d записей", len(records))
     except Exception as exc:
         log.exception("Критическая ошибка: %s", exc)
-        result = {"records": [], "error": str(exc)}
+        # output.json уже содержит частичные данные от on_record — не затираем его
         progress = {
             "bin_current": 0, "bin_total": len(bins),
             "bin_name": "", "contract_current": 0, "contract_total": 0,
             "message": f"Ошибка: {exc}", "done": False,
         }
 
-    # Сначала записываем результаты — потом done=True,
-    # чтобы app.py не прочитал done=True раньше чем появился output.json.
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(result, f, ensure_ascii=False, indent=2)
-    log.info("Результат записан в %s", output_file)
-
-    # Теперь сигнализируем о завершении
+    # Сигнализируем о завершении (done=True) только после записи output
     progress.update(done=True, message="Готово!")
     _write_progress(progress_file, progress)
     log.info("done=True записан в %s", progress_file)
