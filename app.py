@@ -19,6 +19,7 @@ import streamlit as st
 
 from auth import check_credentials
 from excel_export import build_excel_report, get_report_filename
+from excel_export_announcements import build_excel_announcements_report, get_announcements_report_filename
 from scraper import ContractRecord, ScrapeResult
 
 logging.basicConfig(
@@ -143,8 +144,11 @@ def _init_state():
     defaults = {
         "authenticated":     False,
         "current_user":      None,
+        "mode":              None,  # "contracts" или "announcements"
+        "selected_date":     None,  # для режима объявлений
         "bin_list":          [""],
         "results":           None,
+        "results_announcements": None,  # результаты для объявлений
         "excel_bytes":       None,
         "running":           False,
         "tmp_dir":           None,
@@ -215,10 +219,102 @@ st.divider()
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# СТРАНИЦА 1: Форма ввода
+# СТРАНИЦА 1: Выбор режима анализа
 # ──────────────────────────────────────────────────────────────────────────
 
-if not st.session_state.running and st.session_state.results is None:
+if not st.session_state.mode and st.session_state.results is None and st.session_state.results_announcements is None:
+    st.markdown("#### Выберите режим анализа")
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        if st.button(
+            "📋 Анализ реестра договоров",
+            use_container_width=True,
+            type="primary",
+            key="mode_contracts",
+        ):
+            st.session_state.mode = "contracts"
+            st.rerun()
+
+    with col2:
+        if st.button(
+            "📢 Анализ объявлений",
+            use_container_width=True,
+            type="primary",
+            key="mode_announcements",
+        ):
+            st.session_state.mode = "announcements"
+            st.rerun()
+
+    st.stop()
+
+# ──────────────────────────────────────────────────────────────────────────
+# Страница объявлений: выбор даты
+# ──────────────────────────────────────────────────────────────────────────
+
+if st.session_state.mode == "announcements" and st.session_state.results_announcements is None and not st.session_state.running:
+    st.markdown("#### Поиск объявлений по дате")
+
+    selected_date = st.date_input(
+        "Выберите дату окончания приема заявок:",
+        key="announcement_date_picker",
+    )
+
+    st.divider()
+
+    if st.button("🔍 Запустить анализ", use_container_width=True, type="primary"):
+        date_str = selected_date.strftime("%Y-%m-%d")
+        st.session_state.selected_date = date_str
+
+        tmp_dir = tempfile.mkdtemp(prefix="goszakup_announcements_")
+        input_file = os.path.join(tmp_dir, "input.json")
+        output_file = os.path.join(tmp_dir, "output.json")
+        progress_file = os.path.join(tmp_dir, "progress.json")
+        log_file_path = os.path.join(tmp_dir, "worker.log")
+
+        with open(input_file, "w", encoding="utf-8") as f:
+            json.dump({
+                "mode": "announcements",
+                "date": date_str,
+                "progress_file": progress_file
+            }, f, ensure_ascii=False)
+
+        log_file = open(log_file_path, "w", encoding="utf-8")
+        popen_kwargs: dict = {
+            "stdout": log_file,
+            "stderr": sys.stderr,
+        }
+        if os.name != "nt":
+            popen_kwargs["preexec_fn"] = os.setsid
+
+        proc = subprocess.Popen(
+            [sys.executable, "-u", str(WORKER_PATH), input_file, output_file],
+            **popen_kwargs,
+        )
+        log.info("Воркер запущен PID=%d  tmp=%s (объявления)", proc.pid, tmp_dir)
+
+        st.session_state.running = True
+        st.session_state.worker_pid = proc.pid
+        st.session_state.tmp_dir = tmp_dir
+        st.session_state.progress_file = progress_file
+        st.session_state.output_file = output_file
+        st.session_state.log_file_path = log_file_path
+        st.session_state.worker_started_at = time.time()
+        st.rerun()
+
+    st.divider()
+    if st.button("⬅ Вернуться к выбору режима"):
+        st.session_state.mode = None
+        st.rerun()
+
+    st.stop()
+
+# ──────────────────────────────────────────────────────────────────────────
+# СТРАНИЦА 1b: Форма ввода БИН (для режима договоров)
+# ──────────────────────────────────────────────────────────────────────────
+
+if not st.session_state.running and st.session_state.results is None and st.session_state.mode == "contracts":
     st.markdown("#### Введите БИН компаний-поставщиков")
 
     bin_list = st.session_state.bin_list
@@ -297,28 +393,39 @@ if not st.session_state.running and st.session_state.results is None:
 if st.session_state.running:
     progress_file = st.session_state.progress_file
     output_file   = st.session_state.output_file
-    n_bins        = len(st.session_state.bins_to_process)
     started_at    = st.session_state.worker_started_at
 
-    st.markdown("#### 📡 Идёт сбор данных...")
-
-    prog   = _read_json(progress_file) if os.path.exists(progress_file) else {}
-    b_name = prog.get("bin_name", "")
-    b_cur  = prog.get("bin_current", 0)
-    b_tot  = prog.get("bin_total",   n_bins)
-    c_cur  = prog.get("contract_current", 0)
-    c_tot  = prog.get("contract_total",   0)
-    msg    = prog.get("message", "Запуск браузера Chromium...")
-    done   = prog.get("done", False)
-
-    if b_name:
-        st.markdown(f"Обработка БИН **{b_name}** &nbsp; `{b_cur} / {b_tot}`")
+    if st.session_state.mode == "announcements":
+        st.markdown("#### 📡 Идёт сбор данных объявлений...")
     else:
-        st.markdown(f"⏳ {msg}")
+        st.markdown("#### 📡 Идёт сбор данных договоров...")
 
-    st.progress(b_cur / max(b_tot, 1), text=f"Прогресс по БИН: {b_cur}/{b_tot}")
-    if c_tot > 0:
-        st.progress(c_cur / c_tot, text=f"Договор {c_cur} из {c_tot}")
+    prog = _read_json(progress_file) if os.path.exists(progress_file) else {}
+    done = prog.get("done", False)
+    msg = prog.get("message", "Запуск браузера Chromium...")
+
+    if st.session_state.mode == "announcements":
+        a_cur = prog.get("announcement_current", 0)
+        a_tot = prog.get("announcement_total", 0)
+        if a_tot > 0:
+            st.markdown(f"Объявление **{a_cur}** из **{a_tot}**")
+        st.progress(a_cur / max(a_tot, 1), text=f"Прогресс: {a_cur}/{a_tot}")
+    else:
+        b_name = prog.get("bin_name", "")
+        b_cur = prog.get("bin_current", 0)
+        b_tot = prog.get("bin_total", len(st.session_state.bins_to_process))
+        c_cur = prog.get("contract_current", 0)
+        c_tot = prog.get("contract_total", 0)
+
+        if b_name:
+            st.markdown(f"Обработка БИН **{b_name}** &nbsp; `{b_cur} / {b_tot}`")
+        else:
+            st.markdown(f"⏳ {msg}")
+
+        st.progress(b_cur / max(b_tot, 1), text=f"Прогресс по БИН: {b_cur}/{b_tot}")
+        if c_tot > 0:
+            st.progress(c_cur / c_tot, text=f"Договор {c_cur} из {c_tot}")
+
     st.caption(msg)
 
     if st.button("⛔ Остановить сбор данных", type="secondary"):
@@ -329,43 +436,78 @@ if st.session_state.running:
     output_ready = os.path.exists(output_file)
 
     if done and output_ready:
-        error   = None
-        results = []
         try:
-            data    = _read_json(output_file)
-            error   = data.get("error")
+            data = _read_json(output_file)
+            error = data.get("error")
             all_recs = data.get("records", [])
-            results = _records_to_results(all_recs)
-            total_loaded = sum(len(r.records) for r in results)
-            log.info("Загружено %d записей", total_loaded)
 
-            # Выводим ошибки парсинга в лог Render для диагностики
-            err_recs = [r for r in all_recs if r.get("error") and r.get("error") != "Сумма не найдена"]
-            if err_recs:
-                log.warning("Ошибок при парсинге: %d из %d", len(err_recs), total_loaded)
-                for r in err_recs[:30]:
-                    log.warning("  БИН %s | %s | %s",
-                                r.get("bin", "?"),
-                                r.get("url", "")[-70:],
-                                r.get("error", "?"))
+            if st.session_state.mode == "announcements":
+                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
+
+                results = ScrapeAnnouncementsResult(
+                    selected_date=st.session_state.selected_date,
+                    records=[
+                        AnnouncementRecord(
+                            number=r.get("number", 0),
+                            name=r.get("name", ""),
+                            method=r.get("method", ""),
+                            start_date=r.get("start_date", ""),
+                            end_date=r.get("end_date", ""),
+                            sum_amount=r.get("sum_amount", 0.0),
+                            status=r.get("status", ""),
+                            winner_name=r.get("winner_name", ""),
+                            winner_bin=r.get("winner_bin", ""),
+                            winner_price=r.get("winner_price", 0.0),
+                            url=r.get("url", ""),
+                            error=r.get("error", ""),
+                        )
+                        for r in all_recs
+                    ],
+                )
+                total_loaded = len(all_recs)
+                log.info("Загружено %d объявлений", total_loaded)
+
+                excel_bytes = None
+                if results.records:
+                    try:
+                        excel_bytes = build_excel_announcements_report(results)
+                    except Exception as exc:
+                        log.exception("Ошибка Excel (объявления): %s", exc)
+
+                st.session_state.worker_error = error
+                st.session_state.results_announcements = results
+            else:
+                results = _records_to_results(all_recs)
+                total_loaded = sum(len(r.records) for r in results)
+                log.info("Загружено %d записей", total_loaded)
+
+                err_recs = [r for r in all_recs if r.get("error") and r.get("error") != "Сумма не найдена"]
+                if err_recs:
+                    log.warning("Ошибок при парсинге: %d из %d", len(err_recs), total_loaded)
+                    for r in err_recs[:30]:
+                        log.warning("  БИН %s | %s | %s",
+                                    r.get("bin", "?"),
+                                    r.get("url", "")[-70:],
+                                    r.get("error", "?"))
+
+                excel_bytes = None
+                if results:
+                    try:
+                        excel_bytes = build_excel_report(results)
+                    except Exception as exc:
+                        log.exception("Ошибка Excel: %s", exc)
+
+                st.session_state.worker_error = error
+                st.session_state.results = results
+
+            st.session_state.excel_bytes = excel_bytes
+            st.session_state.running = False
+
         except Exception as exc:
             error = f"Ошибка чтения результата: {exc}"
             log.exception(error)
-
-        excel_bytes = None
-        if results:
-            try:
-                excel_bytes = build_excel_report(results)
-            except Exception as exc:
-                log.exception("Ошибка Excel: %s", exc)
-
-        st.session_state.worker_error = error
-        st.session_state.results     = results
-        st.session_state.excel_bytes = excel_bytes
-        st.session_state.running     = False
-
-        if error:
-            st.error(f"❌ {error}")
+            st.session_state.worker_error = error
+            st.session_state.running = False
 
         st.rerun()
 
@@ -374,7 +516,6 @@ if st.session_state.running:
         st.rerun()
 
     elif not _is_worker_alive(st.session_state.get("worker_pid")):
-        # Воркер умер раньше времени (OOM или краш) — проверяем частичные данные
         partial: list[dict] = []
         if os.path.exists(output_file):
             try:
@@ -384,21 +525,63 @@ if st.session_state.running:
 
         if partial:
             log.warning("Воркер завершился досрочно. Частичных записей: %d", len(partial))
-            results = _records_to_results(partial)
-            excel_bytes = None
-            try:
-                excel_bytes = build_excel_report(results)
-            except Exception as exc:
-                log.exception("Ошибка Excel (частичные данные): %s", exc)
-            st.session_state.results      = results
-            st.session_state.excel_bytes  = excel_bytes
-            st.session_state.worker_error = (
-                f"⚠️ Парсинг прерван досрочно — сервер нагружен. "
-                f"Сохранено {len(partial)} из ~{c_tot} договоров."
-            )
+
+            if st.session_state.mode == "announcements":
+                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
+
+                results = ScrapeAnnouncementsResult(
+                    selected_date=st.session_state.selected_date,
+                    records=[
+                        AnnouncementRecord(
+                            number=r.get("number", 0),
+                            name=r.get("name", ""),
+                            method=r.get("method", ""),
+                            start_date=r.get("start_date", ""),
+                            end_date=r.get("end_date", ""),
+                            sum_amount=r.get("sum_amount", 0.0),
+                            status=r.get("status", ""),
+                            winner_name=r.get("winner_name", ""),
+                            winner_bin=r.get("winner_bin", ""),
+                            winner_price=r.get("winner_price", 0.0),
+                            url=r.get("url", ""),
+                            error=r.get("error", ""),
+                        )
+                        for r in partial
+                    ],
+                )
+                excel_bytes = None
+                try:
+                    excel_bytes = build_excel_announcements_report(results)
+                except Exception as exc:
+                    log.exception("Ошибка Excel (объявления): %s", exc)
+
+                st.session_state.results_announcements = results
+                st.session_state.worker_error = (
+                    f"⚠️ Парсинг прерван досрочно — сервер нагружен. "
+                    f"Сохранено {len(partial)} объявлений."
+                )
+            else:
+                results = _records_to_results(partial)
+                excel_bytes = None
+                try:
+                    excel_bytes = build_excel_report(results)
+                except Exception as exc:
+                    log.exception("Ошибка Excel (частичные): %s", exc)
+
+                st.session_state.results = results
+                c_tot = prog.get("contract_total", 0)
+                st.session_state.worker_error = (
+                    f"⚠️ Парсинг прерван досрочно — сервер нагружен. "
+                    f"Сохранено {len(partial)} из ~{c_tot} договоров."
+                )
+
+            st.session_state.excel_bytes = excel_bytes
         else:
             log.error("Воркер завершился без данных")
-            st.session_state.results      = []
+            if st.session_state.mode == "announcements":
+                st.session_state.results_announcements = []
+            else:
+                st.session_state.results = []
             st.session_state.worker_error = "Воркер завершился неожиданно без данных."
 
         st.session_state.running = False
@@ -502,11 +685,101 @@ if st.session_state.results is not None and not st.session_state.running:
 
     st.divider()
     if st.button("🔄 Новый анализ"):
-        st.session_state.results         = None
-        st.session_state.excel_bytes     = None
-        st.session_state.bin_list        = [""]
-        st.session_state.bins_to_process = []
-        st.session_state.running         = False
+        st.session_state.results               = None
+        st.session_state.results_announcements = None
+        st.session_state.excel_bytes           = None
+        st.session_state.bin_list              = [""]
+        st.session_state.bins_to_process       = []
+        st.session_state.running               = False
+        st.session_state.mode                  = None
+        st.session_state.selected_date         = None
+        st.session_state.worker_error          = None
+        st.rerun()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# СТРАНИЦА 3b: Результаты для объявлений
+# ──────────────────────────────────────────────────────────────────────────
+
+if st.session_state.results_announcements is not None and not st.session_state.running:
+    from scraper_announcements import ScrapeAnnouncementsResult
+
+    results: ScrapeAnnouncementsResult = st.session_state.results_announcements
+
+    if not results.records:
+        worker_err = st.session_state.get("worker_error")
+        if worker_err:
+            st.error(f"❌ Ошибка: {worker_err}")
+        log_path = st.session_state.get("log_file_path")
+        if log_path and os.path.exists(log_path):
+            with open(log_path, encoding="utf-8") as f:
+                st.code(f.read()[-3000:], language="text")
+        else:
+            st.error("❌ Данные не получены.")
+    else:
+        worker_err = st.session_state.get("worker_error")
+        if worker_err and worker_err.startswith("⚠️"):
+            st.warning(worker_err)
+        elif worker_err:
+            st.error(f"❌ {worker_err}")
+
+        if not worker_err:
+            st.success("✅ Анализ объявлений успешно завершён!")
+        st.markdown("#### 📊 Результаты объявлений")
+
+        total_announcements = len(results.records)
+        total_errors = len(results.errors)
+        total_sum = sum(r.sum_amount for r in results.records if not r.error)
+        total_price = sum(r.winner_price for r in results.records if not r.error and r.winner_price > 0)
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Всего объявлений", total_announcements)
+        c2.metric("Ошибок при сборе", total_errors)
+        c3.metric("Сумма закупок", f"{total_sum:,.0f} ₸")
+        c4.metric("Цена победителей", f"{total_price:,.0f} ₸")
+        st.divider()
+
+        for idx, rec in enumerate(results.records[:15], 1):
+            has_error = bool(rec.error)
+            icon = "⚠️" if has_error else "📢"
+            name = f"⚠ {rec.error}" if has_error else rec.name[:70]
+            winner_info = f"{rec.winner_name} (БИН: {rec.winner_bin})" if rec.winner_bin else "—"
+            price_str = f"{rec.winner_price:,.0f} ₸" if rec.winner_price > 0 else "—"
+
+            st.markdown(
+                f"{icon} **№{rec.number}. {name}**  \n"
+                f"Способ: `{rec.method}` | Статус: `{rec.status}`  \n"
+                f"Сумма: `{rec.sum_amount:,.0f} ₸` | Победитель: `{winner_info}` | Цена: `{price_str}`  \n"
+                f"Даты: `{rec.start_date}` — `{rec.end_date}`"
+                + (f"  — [{rec.url}]({rec.url})" if rec.url else "")
+            )
+            st.divider()
+
+        if len(results.records) > 15:
+            st.caption(f"... и ещё {len(results.records) - 15} объявлений в Excel-файле")
+
+        st.divider()
+        if st.session_state.excel_bytes:
+            st.download_button(
+                label="⬇️ Скачать Excel-отчёт",
+                data=st.session_state.excel_bytes,
+                file_name=get_announcements_report_filename(),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                type="primary",
+            )
+
+    st.divider()
+    if st.button("🔄 Новый анализ"):
+        st.session_state.results               = None
+        st.session_state.results_announcements = None
+        st.session_state.excel_bytes           = None
+        st.session_state.bin_list              = [""]
+        st.session_state.bins_to_process       = []
+        st.session_state.running               = False
+        st.session_state.mode                  = None
+        st.session_state.selected_date         = None
+        st.session_state.worker_error          = None
         st.rerun()
 
 

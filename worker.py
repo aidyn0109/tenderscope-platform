@@ -5,10 +5,11 @@ worker.py — Автономный процесс парсинга.
     python worker.py <json_input_file> <json_output_file>
 
 Обмен данными через временные JSON-файлы:
-  input:  {"bins": ["БИН1", "БИН2"], "progress_file": "path/to/prog.json"}
+  input:  {"bins": ["БИН1", "БИН2"], "progress_file": "path/to/prog.json"}  # режим договоров
+          {"mode": "announcements", "date": "YYYY-MM-DD", "progress_file": "path/to/prog.json"}  # режим объявлений
   output: {"records": [...], "error": null}
 
-Ключевое свойство: output.json пишется ПОСЛЕ КАЖДОГО договора через on_record callback.
+Ключевое свойство: output.json пишется ПОСЛЕ КАЖДОГО договора/объявления через on_record callback.
 Если воркер убьют (OOM), app.py найдёт частичные данные и покажет их пользователю.
 done=True пишется только после полного завершения.
 """
@@ -27,6 +28,7 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 from scraper import ContractRecord, ScrapeResult, scrape_all
+from scraper_announcements import AnnouncementRecord, scrape_announcements
 
 
 def _write_progress(path: str, data: dict) -> None:
@@ -62,6 +64,23 @@ def _rec_to_dict(rec: ContractRecord) -> dict:
         "difference":      rec.difference,
         "url":             rec.url,
         "error":           rec.error,
+    }
+
+
+def _ann_to_dict(rec: AnnouncementRecord) -> dict:
+    return {
+        "number":        rec.number,
+        "name":          rec.name,
+        "method":        rec.method,
+        "start_date":    rec.start_date,
+        "end_date":      rec.end_date,
+        "sum_amount":    rec.sum_amount,
+        "status":        rec.status,
+        "winner_name":   rec.winner_name,
+        "winner_bin":    rec.winner_bin,
+        "winner_price":  rec.winner_price,
+        "url":           rec.url,
+        "error":         rec.error,
     }
 
 
@@ -111,6 +130,34 @@ def _run(bins: list[str], progress_file: str, output_file: str) -> tuple[list[di
     return all_records, progress
 
 
+def _run_announcements(date: str, progress_file: str, output_file: str) -> tuple[list[dict], dict]:
+    progress = {
+        "announcement_current": 0,
+        "announcement_total":   0,
+        "message":              "Запуск браузера...",
+        "done":                 False,
+    }
+    _write_progress(progress_file, progress)
+
+    all_records: list[dict] = []
+    _write_output(output_file, all_records)
+
+    def on_progress(cur: int, tot: int, msg: str) -> None:
+        log.info("  объявление %d/%d", cur, tot)
+        progress.update(announcement_current=cur, announcement_total=tot, message=msg)
+        _write_progress(progress_file, progress)
+
+    def on_record(rec: AnnouncementRecord) -> None:
+        """Вызывается сразу после парсинга каждого объявления — сохраняем на диск."""
+        all_records.append(_ann_to_dict(rec))
+        _write_output(output_file, all_records)
+        log.info("  сохранено %d записей", len(all_records))
+
+    result = scrape_announcements(date, on_progress=on_progress, on_record=on_record)
+
+    return all_records, progress
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         print("Usage: python worker.py <input.json> <output.json>", file=sys.stderr)
@@ -122,13 +169,22 @@ def main() -> None:
     with open(input_file, encoding="utf-8") as f:
         params = json.load(f)
 
-    bins          = params["bins"]
-    progress_file = params["progress_file"]
+    progress_file = params.get("progress_file")
+    mode = params.get("mode", "contracts")  # по умолчанию режим договоров
 
-    log.info("Старт. БИН: %s", bins)
+    log.info("Старт. Режим: %s", mode)
 
     try:
-        records, progress = _run(bins, progress_file, output_file)
+        if mode == "announcements":
+            date = params.get("date")
+            log.info("Парсинг объявлений за дату: %s", date)
+            records, progress = _run_announcements(date, progress_file, output_file)
+        else:
+            # Режим договоров (оригинальный)
+            bins = params.get("bins", [])
+            log.info("Парсинг договоров для БИН: %s", bins)
+            records, progress = _run(bins, progress_file, output_file)
+
         # Финальная запись — фиксируем итоговый список (on_record уже писал частично)
         _write_output(output_file, records)
         log.info("Результат финализирован: %d записей", len(records))
@@ -136,7 +192,8 @@ def main() -> None:
         log.exception("Критическая ошибка: %s", exc)
         # output.json уже содержит частичные данные от on_record — не затираем его
         progress = {
-            "bin_current": 0, "bin_total": len(bins),
+            "announcement_current": 0, "announcement_total": 0,
+            "bin_current": 0, "bin_total": 0,
             "bin_name": "", "contract_current": 0, "contract_total": 0,
             "message": f"Ошибка: {exc}", "done": False,
         }
