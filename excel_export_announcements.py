@@ -91,14 +91,16 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
     for record in result.records:
         ws.row_dimensions[row_idx].height = 15
 
-        has_error = bool(record.error)
-
         # A — №
         _apply_cell_style(ws.cell(row=row_idx, column=1), record.number)
 
-        # B — Наименование объявления
-        name = f"⚠ {record.error}" if has_error else record.name
-        _apply_cell_style(ws.cell(row=row_idx, column=2), name)
+        # B — Наименование объявления (всегда из листинга; если совсем нет — показываем ошибку)
+        if record.name:
+            _apply_cell_style(ws.cell(row=row_idx, column=2), record.name)
+        elif record.error:
+            _apply_cell_style(ws.cell(row=row_idx, column=2), f"⚠ {record.error}")
+        else:
+            _apply_cell_style(ws.cell(row=row_idx, column=2), "")
 
         # C — Способ
         _apply_cell_style(ws.cell(row=row_idx, column=3), record.method or "")
@@ -109,32 +111,37 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
         # E — Окончание приема заявок
         _apply_cell_style(ws.cell(row=row_idx, column=5), record.end_date or "")
 
-        # F — Сумма, тг.
+        # F — Сумма, тг. (из листинга — всегда заполняем, если есть значение)
         cell_f = ws.cell(row=row_idx, column=6)
-        if has_error:
-            _apply_cell_style(cell_f, "—")
-        else:
+        if record.sum_amount > 0:
             _apply_cell_style(cell_f, record.sum_amount, is_number=True)
+        else:
+            _apply_cell_style(cell_f, "—")
 
         # G — Статус
         _apply_cell_style(ws.cell(row=row_idx, column=7), record.status or "")
 
         # H — Наименование победителя
-        _apply_cell_style(ws.cell(row=row_idx, column=8), record.winner_name or "")
+        _apply_cell_style(ws.cell(row=row_idx, column=8), record.winner_name or "—")
 
         # I — БИН победителя
-        _apply_cell_style(ws.cell(row=row_idx, column=9), record.winner_bin or "")
+        _apply_cell_style(ws.cell(row=row_idx, column=9), record.winner_bin or "—")
 
         # J — Цена победителя, тг.
+        #   • если есть данные в «Договоры»  → ячейка пустая (по ТЗ);
+        #   • иначе если есть цена           → число;
+        #   • иначе                          → «—».
         cell_j = ws.cell(row=row_idx, column=10)
-        if has_error or record.winner_price == 0.0:
-            _apply_cell_style(cell_j, "—")
-        else:
+        if record.has_contracts:
+            _apply_cell_style(cell_j, "")
+        elif record.winner_price > 0:
             _apply_cell_style(cell_j, record.winner_price, is_number=True)
+        else:
+            _apply_cell_style(cell_j, "—")
 
-        # K — Гиперссылка
+        # K — Гиперссылка (всегда показываем, если URL известен)
         cell_k = ws.cell(row=row_idx, column=11)
-        if record.url and not has_error:
+        if record.url:
             cell_k.value = record.url
             cell_k.hyperlink = record.url
             cell_k.font = LINK_FONT

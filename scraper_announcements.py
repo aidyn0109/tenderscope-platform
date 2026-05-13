@@ -62,9 +62,9 @@ TARGET_SUBJECT_TEXT = "Работа"
 
 BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
 
-REQUEST_DELAY = 0.4
+REQUEST_DELAY = 0.15
 RETRY_COUNT = 2
-PAGE_RECYCLE_INTERVAL = 5
+PAGE_RECYCLE_INTERVAL = 10
 
 logger = logging.getLogger(__name__)
 
@@ -84,8 +84,9 @@ class AnnouncementRecord:
     status: str                  # статус
     winner_name: str             # наименование победителя
     winner_bin: str              # БИН победителя
-    winner_price: float          # цена победителя (0 если нет данных или есть договоры)
+    winner_price: float          # цена победителя (0 если нет данных)
     url: str                     # гиперссылка на объявление
+    has_contracts: bool = False  # есть ли данные во вкладке «Договоры»
     error: str = ""              # ошибка при парсинге
 
 
@@ -563,98 +564,137 @@ def collect_announcement_links(page: Page) -> list[dict]:
 # Парсинг одного объявления
 # ---------------------------------------------------------------------------
 
-def _click_tab(page: Page, tab_text: str) -> bool:
-    """
-    Кликает по вкладке (li / a / button) с заданным видимым текстом.
-    Возвращает True, если клик прошёл успешно.
-    """
-    candidates = [
-        page.locator("ul.nav li a").filter(has_text=tab_text),
-        page.locator("a[role='tab']").filter(has_text=tab_text),
-        page.locator("a[data-toggle='tab']").filter(has_text=tab_text),
-        page.locator("a").filter(has_text=tab_text),
-        page.locator("button").filter(has_text=tab_text),
-    ]
-    for loc in candidates:
-        if loc.count():
-            try:
-                loc.first.click()
-                page.wait_for_timeout(450)
-                return True
-            except Exception:
-                continue
-    return False
+# ---------------------------------------------------------------------------
+# Универсальный парсер вкладок: одним обходом DOM извлекаем
+#   • has_contracts (есть ли реальные записи во вкладке «Договоры»)
+#   • winner_text   (содержимое колонки «Победитель» из первой строки таблицы)
+#   • protocol_url  (href ссылки «Просмотреть протокол» — если есть в DOM)
+# Все три вкладки goszakup рендерятся в DOM сразу (Bootstrap-стиль), поэтому
+# кликать по вкладкам не нужно — экономим ~1–2 сек на каждое объявление.
+# ---------------------------------------------------------------------------
 
+_PARSE_TABS_JS = r"""() => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 
-_HAS_CONTRACTS_JS = """() => {
-    // Найти активную панель вкладки
-    const panes = document.querySelectorAll('.tab-pane.active, [role="tabpanel"]');
-    let pane = null;
-    for (const p of panes) {
-        if (p.offsetParent !== null) { pane = p; break; }
-    }
-    if (!pane) return false;
-
-    // Считаем содержательные строки в любой таблице внутри панели.
-    const tables = pane.querySelectorAll('table');
-    for (const t of tables) {
-        const rows = t.querySelectorAll('tbody tr');
-        let real = 0;
-        for (const r of rows) {
-            const txt = (r.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-            if (!txt) continue;
-            if (txt.includes('нет данных') || txt.includes('отсутству') ||
-                txt.includes('не найдено')) continue;
-            real += 1;
+    // Сопоставляем панели вкладок (.tab-pane / [role=tabpanel]) с подписями
+    // соответствующих ссылок (a[href="#id"], a[data-bs-target="#id"], ul.nav li a).
+    const panes = Array.from(document.querySelectorAll('.tab-pane, [role="tabpanel"], .tab-content > div'));
+    const labelFor = (pane) => {
+        const id = pane.id;
+        if (!id) return '';
+        const anchors = document.querySelectorAll(
+            `a[href="#${id}"], a[data-bs-target="#${id}"], a[aria-controls="${id}"], button[data-bs-target="#${id}"]`
+        );
+        for (const a of anchors) {
+            const t = norm(a.textContent);
+            if (t) return t;
         }
-        if (real > 0) return true;
+        return '';
+    };
+
+    const isContractsPane = (pane, label) => {
+        if (label.includes('договор')) return true;
+        // Эвристика — если в панели нет явной метки, но видны характерные подписи
+        const txt = norm(pane.innerText);
+        return txt.includes('номер договора') && !txt.includes('победител');
+    };
+    const isWinnersPane = (pane, label) =>
+        label.includes('победител') || label.includes('информация о победителях');
+    const isProtocolsPane = (pane, label) =>
+        label.includes('протокол');
+
+    const hasRealRows = (pane) => {
+        const tables = pane.querySelectorAll('table');
+        for (const t of tables) {
+            const bodyRows = t.tBodies[0] ? t.tBodies[0].rows : t.querySelectorAll('tr');
+            for (const r of bodyRows) {
+                // Пропускаем заголовочные строки
+                if (r.querySelector('th') && r.cells.length === r.querySelectorAll('th').length) continue;
+                const txt = norm(r.innerText);
+                if (!txt) continue;
+                if (txt.includes('нет данных') || txt.includes('отсутству') || txt.includes('не найдено')) continue;
+                if (r.cells.length > 0) return true;
+            }
+        }
+        return false;
+    };
+
+    const winnerFromPane = (pane) => {
+        const tables = pane.querySelectorAll('table');
+        for (const table of tables) {
+            let headerCells = [];
+            if (table.tHead && table.tHead.rows[0]) headerCells = Array.from(table.tHead.rows[0].cells);
+            else if (table.rows[0]) headerCells = Array.from(table.rows[0].cells);
+            const headers = headerCells.map(c => norm(c.innerText));
+            const winnerIdx = headers.findIndex(h => h.includes('победител'));
+            if (winnerIdx === -1) continue;
+            const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : Array.from(table.rows).slice(1);
+            for (const r of bodyRows) {
+                if (r.cells.length <= winnerIdx) continue;
+                const t = (r.cells[winnerIdx].innerText || '').trim();
+                if (t) return t;
+            }
+        }
+        return null;
+    };
+
+    const protocolUrlFromPane = (pane) => {
+        const anchors = pane.querySelectorAll('a');
+        for (const a of anchors) {
+            const t = norm(a.textContent);
+            const href = a.getAttribute('href') || '';
+            if (!href || href.startsWith('javascript:')) continue;
+            if (t.includes('просмотреть') || t.includes('протокол итогов') || href.includes('protokol')) {
+                return href;
+            }
+        }
+        return null;
+    };
+
+    const out = { hasContracts: false, winnerText: null, protocolUrl: null };
+
+    // Если панелей нет вовсе — пытаемся работать со всей страницей как одним «pane»
+    const targets = panes.length ? panes : [document.body];
+
+    for (const pane of targets) {
+        const label = panes.length ? labelFor(pane) : '';
+        if (panes.length && isContractsPane(pane, label)) {
+            if (hasRealRows(pane)) out.hasContracts = true;
+        }
+        if (panes.length && isWinnersPane(pane, label)) {
+            if (!out.winnerText) {
+                const w = winnerFromPane(pane);
+                if (w) out.winnerText = w;
+            }
+        }
+        if (panes.length && isProtocolsPane(pane, label)) {
+            if (!out.protocolUrl) {
+                const u = protocolUrlFromPane(pane);
+                if (u) out.protocolUrl = u;
+            }
+        }
     }
-    // На случай, если данные показаны не таблицей
-    const txt = (pane.innerText || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    if (txt.length > 80 && !txt.includes('нет данных') && !txt.includes('отсутству')) {
-        // Эвристика: должна присутствовать характерная подпись договора
-        if (txt.includes('договор') || txt.includes('номер договора')) return true;
+
+    // Фолбэк: если не нашли по label-меткам, пройдёмся по всему документу
+    if (!out.winnerText) {
+        const w = winnerFromPane(document.body);
+        if (w) out.winnerText = w;
     }
-    return false;
+    if (!out.protocolUrl) {
+        const u = protocolUrlFromPane(document.body);
+        if (u) out.protocolUrl = u;
+    }
+    if (!out.hasContracts && panes.length === 0) {
+        // Никаких вкладок — ничего сказать не можем
+        out.hasContracts = false;
+    }
+
+    return out;
 }"""
 
 
-_PARSE_WINNER_JS = """() => {
-    const panes = document.querySelectorAll('.tab-pane.active, [role="tabpanel"]');
-    let pane = null;
-    for (const p of panes) {
-        if (p.offsetParent !== null) { pane = p; break; }
-    }
-    if (!pane) return null;
-
-    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const tables = pane.querySelectorAll('table');
-    for (const table of tables) {
-        // Заголовок
-        let headerCells = [];
-        if (table.tHead && table.tHead.rows[0]) {
-            headerCells = Array.from(table.tHead.rows[0].cells);
-        } else if (table.rows[0]) {
-            headerCells = Array.from(table.rows[0].cells);
-        }
-        const headers = headerCells.map(c => norm(c.innerText));
-        const winnerIdx = headers.findIndex(h => h.includes('победител'));
-        if (winnerIdx === -1) continue;
-
-        const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : Array.from(table.rows).slice(1);
-        for (const r of bodyRows) {
-            const cells = r.cells;
-            if (cells.length <= winnerIdx) continue;
-            const cellText = (cells[winnerIdx].innerText || '').trim();
-            if (cellText) return cellText;
-        }
-    }
-    return null;
-}"""
-
-
-_PARSE_PROTOCOL_PRICE_JS = """(winnerBin) => {
-    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
+_PARSE_PROTOCOL_PRICE_JS = r"""(winnerBin) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
     const tables = document.querySelectorAll('table');
     for (const table of tables) {
         const tableTxt = norm(table.innerText);
@@ -668,22 +708,20 @@ _PARSE_PROTOCOL_PRICE_JS = """(winnerBin) => {
         }
         const headers = headerCells.map(c => norm(c.innerText));
 
-        let binCol = headers.findIndex(h =>
+        const binCol = headers.findIndex(h =>
             h.includes('бин') || h.includes('инн') || h.includes('унп'));
         let priceCol = headers.findIndex(h =>
             h.includes('цена') && (h.includes('поставщик') || h.includes('участник')));
         if (priceCol === -1) priceCol = headers.findIndex(h => h.includes('цена поставщика'));
         if (priceCol === -1) priceCol = headers.findIndex(h => h === 'цена');
-
         if (binCol === -1 || priceCol === -1) continue;
 
         const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : Array.from(table.rows).slice(1);
         for (const r of bodyRows) {
-            const cells = r.cells;
-            if (cells.length <= Math.max(binCol, priceCol)) continue;
-            const binText = (cells[binCol].innerText || '').trim();
+            if (r.cells.length <= Math.max(binCol, priceCol)) continue;
+            const binText = (r.cells[binCol].innerText || '').trim();
             if (binText.includes(winnerBin)) {
-                return (cells[priceCol].innerText || '').trim();
+                return (r.cells[priceCol].innerText || '').trim();
             }
         }
     }
@@ -691,82 +729,36 @@ _PARSE_PROTOCOL_PRICE_JS = """(winnerBin) => {
 }"""
 
 
-def _has_contracts_data(page: Page) -> bool:
-    """Возвращает True, если во вкладке «Договоры» есть содержательные записи."""
-    if not _click_tab(page, "Договоры"):
-        return False
-    try:
-        return bool(page.evaluate(_HAS_CONTRACTS_JS))
-    except Exception as exc:
-        logger.debug("_has_contracts_data error: %s", exc)
-        return False
-
-
-def _parse_winner(page: Page) -> tuple[str, str]:
-    """Возвращает (наименование_компании, БИН) из вкладки «Информация о победителях»."""
-    if not _click_tab(page, "Информация о победителях") and not _click_tab(page, "победителях"):
-        return "", ""
-    try:
-        raw = page.evaluate(_PARSE_WINNER_JS)
-    except Exception as exc:
-        logger.debug("_parse_winner error: %s", exc)
-        return "", ""
-
-    if not raw:
-        return "", ""
-    winner_bin = _extract_bin(raw)
-    winner_name = _clean_company_name(raw, winner_bin)
-    return winner_name, winner_bin
-
-
-def _parse_protocol_price(page: Page, winner_bin: str) -> float:
-    """Открывает «Просмотреть протокол» во вкладке «Протоколы» и достаёт цену поставщика."""
-    if not winner_bin:
+def _fetch_protocol_price(page: Page, protocol_url: str, winner_bin: str) -> float:
+    """Открывает HTML протокола напрямую по URL и парсит цену поставщика."""
+    if not protocol_url or not winner_bin:
         return 0.0
-    if not _click_tab(page, "Протоколы"):
-        return 0.0
+    absolute = protocol_url if protocol_url.startswith("http") else BASE_URL + protocol_url
 
-    view_btn_candidates = [
-        page.locator("a:has-text('Просмотреть протокол')"),
-        page.locator("button:has-text('Просмотреть протокол')"),
-        page.locator("a:has-text('Просмотреть')"),
-        page.locator("button:has-text('Просмотреть')"),
-    ]
-    view_btn = None
-    for loc in view_btn_candidates:
-        if loc.count():
-            view_btn = loc.first
-            break
-    if view_btn is None:
-        logger.debug("Кнопка «Просмотреть протокол» не найдена")
-        return 0.0
-
+    # Используем отдельную страницу-«разводной мост»: не ломаем основную page,
+    # с которой работает цикл по объявлениям.
     protocol_page = None
-    opened_new = False
     try:
-        try:
-            with page.context.expect_page(timeout=4000) as new_info:
-                view_btn.click()
-            protocol_page = new_info.value
-            protocol_page.wait_for_load_state("domcontentloaded",
-                                              timeout=PLAYWRIGHT_CONFIG["timeout"])
-            opened_new = True
-        except Exception:
-            view_btn.click()
-            page.wait_for_load_state("domcontentloaded",
-                                     timeout=PLAYWRIGHT_CONFIG["timeout"])
-            protocol_page = page
-
-        protocol_page.wait_for_timeout(600)
+        protocol_page = page.context.new_page()
+        _setup_page_routes(protocol_page)
+        for attempt in range(1, RETRY_COUNT + 2):
+            try:
+                protocol_page.goto(absolute, wait_until="domcontentloaded",
+                                   timeout=PLAYWRIGHT_CONFIG["timeout"])
+                break
+            except Exception as exc:
+                if attempt > RETRY_COUNT:
+                    logger.debug("Не удалось открыть протокол %s: %s", absolute, exc)
+                    return 0.0
+                time.sleep(1)
 
         raw_price = protocol_page.evaluate(_PARSE_PROTOCOL_PRICE_JS, winner_bin)
         return _parse_amount(raw_price) if raw_price else 0.0
-
     except Exception as exc:
-        logger.debug("_parse_protocol_price error: %s", exc)
+        logger.debug("_fetch_protocol_price error: %s", exc)
         return 0.0
     finally:
-        if opened_new and protocol_page is not None and protocol_page is not page:
+        if protocol_page is not None:
             try:
                 protocol_page.close()
             except Exception:
@@ -775,12 +767,13 @@ def _parse_protocol_price(page: Page, winner_bin: str) -> float:
 
 def parse_announcement(page: Page, ann_data: dict, index: int) -> AnnouncementRecord:
     """
-    Парсит одно объявление по правилам алгоритма.
-
-    Алгоритм:
-      1. Открыть страницу объявления.
-      2. Вкладка «Договоры»: если есть данные → парсим только победителя
-         (цена остаётся пустой). Если нет → парсим победителя и цену из протокола.
+    Парсит одно объявление:
+      1. Открывает страницу объявления.
+      2. Одним JS-обходом DOM извлекает has_contracts, текст победителя
+         и URL «Просмотреть протокол» из всех вкладок (Bootstrap-табы рендерятся
+         в DOM сразу — клики не нужны).
+      3. Если has_contracts=True → цена остаётся 0 (по ТЗ оставляем пустой),
+         иначе → загружаем HTML протокола и парсим «Цену поставщика» по БИН.
     """
     url = ann_data["url"]
     number_str = (ann_data.get("number") or "").strip()
@@ -798,6 +791,7 @@ def parse_announcement(page: Page, ann_data: dict, index: int) -> AnnouncementRe
         winner_bin="",
         winner_price=0.0,
         url=url,
+        has_contracts=False,
         error="",
     )
 
@@ -805,28 +799,34 @@ def parse_announcement(page: Page, ann_data: dict, index: int) -> AnnouncementRe
         try:
             page.goto(url, wait_until="domcontentloaded",
                       timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(400)
             break
         except Exception as exc:
             if attempt > RETRY_COUNT:
                 record.error = f"Ошибка загрузки: {exc}"
                 return record
-            time.sleep(2)
+            time.sleep(1)
 
-    has_contracts = _has_contracts_data(page)
-    logger.debug("URL=%s has_contracts=%s", url, has_contracts)
+    try:
+        tabs_data = page.evaluate(_PARSE_TABS_JS) or {}
+    except Exception as exc:
+        logger.debug("_PARSE_TABS_JS error %s: %s", url, exc)
+        tabs_data = {}
 
-    winner_name, winner_bin = _parse_winner(page)
-    record.winner_name = winner_name
-    record.winner_bin = winner_bin
+    has_contracts = bool(tabs_data.get("hasContracts"))
+    winner_text = tabs_data.get("winnerText") or ""
+    protocol_url = tabs_data.get("protocolUrl") or ""
 
-    if has_contracts:
-        # По заданию: оставляем цену пустой, всё остальное заполняем.
-        record.winner_price = 0.0
-    else:
-        record.winner_price = _parse_protocol_price(page, winner_bin)
+    record.has_contracts = has_contracts
 
-    if not winner_bin:
+    if winner_text:
+        winner_bin = _extract_bin(winner_text)
+        record.winner_bin = winner_bin
+        record.winner_name = _clean_company_name(winner_text, winner_bin)
+
+    if not has_contracts and record.winner_bin and protocol_url:
+        record.winner_price = _fetch_protocol_price(page, protocol_url, record.winner_bin)
+
+    if not record.winner_bin:
         record.error = "Победитель не найден"
 
     return record

@@ -80,6 +80,7 @@ def _ann_to_dict(rec: AnnouncementRecord) -> dict:
         "winner_bin":    rec.winner_bin,
         "winner_price":  rec.winner_price,
         "url":           rec.url,
+        "has_contracts": rec.has_contracts,
         "error":         rec.error,
     }
 
