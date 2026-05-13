@@ -171,6 +171,22 @@ PAGE_CONTRACTS = "contracts"
 PAGE_ANNOUNCEMENTS = "announcements"
 
 
+def form_container():
+    """
+    Узкая центральная колонка для форм ввода — на широком layout формы
+    не растягиваются на всю ширину окна.
+    Использовать как: `with form_container(): ...`.
+    """
+    _l, mid, _r = st.columns([1, 2, 1])
+    return mid
+
+
+def home_container():
+    """Чуть шире, чем form_container — для карточек главной."""
+    _l, mid, _r = st.columns([1, 3, 1])
+    return mid
+
+
 # ── Валидация ─────────────────────────────────────────────────────────────
 
 def validate_bin(s: str) -> bool:
@@ -454,51 +470,52 @@ if (st.session_state.page == PAGE_HOME
         and st.session_state.results is None
         and st.session_state.results_announcements is None):
 
-    col1, col2 = st.columns(2, gap="large")
+    with home_container():
+        col1, col2 = st.columns(2, gap="large")
 
-    with col1:
-        st.markdown(
-            """
-            <div class="ts-card">
-                <div class="ts-card-icon">📋</div>
-                <div class="ts-card-title">Анализ реестра договоров</div>
-                <div class="ts-card-text">
-                    Введите БИН компаний-поставщиков — система соберёт все действующие
-                    договоры с goszakup.gov.kz, рассчитает разницу между итоговой
-                    и фактической суммами и выгрузит Excel-отчёт.
+        with col1:
+            st.markdown(
+                """
+                <div class="ts-card">
+                    <div class="ts-card-icon">📋</div>
+                    <div class="ts-card-title">Анализ реестра договоров</div>
+                    <div class="ts-card-text">
+                        Введите БИН компаний-поставщиков — система соберёт все действующие
+                        договоры с goszakup.gov.kz, рассчитает разницу между итоговой
+                        и фактической суммами и выгрузит Excel-отчёт.
+                    </div>
                 </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Перейти к анализу договоров",
-                     key="goto_contracts",
-                     type="primary",
-                     use_container_width=True):
-            _nav_to(PAGE_CONTRACTS)
-            st.rerun()
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Перейти к анализу договоров",
+                         key="goto_contracts",
+                         type="primary",
+                         use_container_width=True):
+                _nav_to(PAGE_CONTRACTS)
+                st.rerun()
 
-    with col2:
-        st.markdown(
-            """
-            <div class="ts-card">
-                <div class="ts-card-icon">📢</div>
-                <div class="ts-card-title">Анализ объявлений</div>
-                <div class="ts-card-text">
-                    Выберите дату окончания приёма заявок — система найдёт
-                    подходящие закупочные объявления, извлечёт информацию
-                    о победителях и цене из протоколов.
+        with col2:
+            st.markdown(
+                """
+                <div class="ts-card">
+                    <div class="ts-card-icon">📢</div>
+                    <div class="ts-card-title">Анализ объявлений</div>
+                    <div class="ts-card-text">
+                        Выберите дату окончания приёма заявок — система найдёт
+                        подходящие закупочные объявления, извлечёт информацию
+                        о победителях и цене из протоколов.
+                    </div>
                 </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
-        if st.button("Перейти к анализу объявлений",
-                     key="goto_announcements",
-                     type="primary",
-                     use_container_width=True):
-            _nav_to(PAGE_ANNOUNCEMENTS)
-            st.rerun()
+                """,
+                unsafe_allow_html=True,
+            )
+            if st.button("Перейти к анализу объявлений",
+                         key="goto_announcements",
+                         type="primary",
+                         use_container_width=True):
+                _nav_to(PAGE_ANNOUNCEMENTS)
+                st.rerun()
 
     st.stop()
 
@@ -511,22 +528,28 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
         and st.session_state.results_announcements is None
         and not st.session_state.running):
 
-    st.markdown("#### Поиск объявлений по дате")
+    with form_container():
+        st.markdown("#### Поиск объявлений по дате")
 
-    selected_date = st.date_input(
-        "Дата окончания приёма заявок:",
-        key="announcement_date_picker",
-    )
+        selected_date = st.date_input(
+            "Дата окончания приёма заявок:",
+            key="announcement_date_picker",
+        )
 
-    st.caption(
-        "Применяются фиксированные фильтры: статус «Завершено» и «Формирование протокола итогов», "
-        "предмет закупки «Работа», сумма закупки от 1 500 000 000 ₸."
-    )
+        st.caption(
+            "Применяются фиксированные фильтры: статус «Завершено» и «Формирование протокола итогов», "
+            "предмет закупки «Работа», сумма закупки от 1 500 000 000 ₸."
+        )
 
-    st.divider()
+        st.divider()
 
-    if st.button("🔍 Запустить анализ", use_container_width=True, type="primary",
-                 key="run_announcements"):
+        run_announcements_clicked = st.button(
+            "🔍 Запустить анализ",
+            use_container_width=True, type="primary",
+            key="run_announcements",
+        )
+
+    if run_announcements_clicked:
         date_str = selected_date.strftime("%Y-%m-%d")
         st.session_state.selected_date = date_str
 
@@ -576,40 +599,45 @@ if (st.session_state.page == PAGE_CONTRACTS
         and not st.session_state.running
         and st.session_state.results is None):
 
-    st.markdown("#### Введите БИН компаний-поставщиков")
+    with form_container():
+        st.markdown("#### Введите БИН компаний-поставщиков")
 
-    bin_list = st.session_state.bin_list
-    for i in range(len(bin_list)):
-        col_in, col_rm = st.columns([5, 1])
-        with col_in:
-            val = st.text_input(
-                f"БИН {i+1}", value=bin_list[i], key=f"bin_{i}",
-                placeholder="000000000000 (12 цифр)", max_chars=12,
-                label_visibility="collapsed",
-            )
-            bin_list[i] = val.strip()
-            if val.strip() and not validate_bin(val):
-                st.caption("⚠️ БИН должен содержать ровно 12 цифр")
-        with col_rm:
-            if len(bin_list) > 1:
-                if st.button("✕", key=f"rm_{i}"):
-                    bin_list.pop(i); st.rerun()
-            else:
-                st.write("")
+        bin_list = st.session_state.bin_list
+        for i in range(len(bin_list)):
+            col_in, col_rm = st.columns([5, 1])
+            with col_in:
+                val = st.text_input(
+                    f"БИН {i+1}", value=bin_list[i], key=f"bin_{i}",
+                    placeholder="000000000000 (12 цифр)", max_chars=12,
+                    label_visibility="collapsed",
+                )
+                bin_list[i] = val.strip()
+                if val.strip() and not validate_bin(val):
+                    st.caption("⚠️ БИН должен содержать ровно 12 цифр")
+            with col_rm:
+                if len(bin_list) > 1:
+                    if st.button("✕", key=f"rm_{i}"):
+                        bin_list.pop(i); st.rerun()
+                else:
+                    st.write("")
 
-    col_add, _ = st.columns([2, 5])
-    with col_add:
-        if st.button("＋ Добавить БИН", use_container_width=True):
-            bin_list.append(""); st.rerun()
+        col_add, _ = st.columns([2, 5])
+        with col_add:
+            if st.button("＋ Добавить БИН", use_container_width=True):
+                bin_list.append(""); st.rerun()
 
-    st.session_state.bin_list = bin_list
-    st.divider()
+        st.session_state.bin_list = bin_list
+        st.divider()
 
-    filled = [b for b in bin_list if b.strip()]
-    ok     = bool(filled) and all(validate_bin(b) for b in filled)
+        filled = [b for b in bin_list if b.strip()]
+        ok     = bool(filled) and all(validate_bin(b) for b in filled)
 
-    if st.button("🔍 Запустить анализ", disabled=not ok, type="primary",
-                 use_container_width=True, key="run_contracts"):
+        run_contracts_clicked = st.button(
+            "🔍 Запустить анализ", disabled=not ok, type="primary",
+            use_container_width=True, key="run_contracts",
+        )
+
+    if run_contracts_clicked:
         tmp_dir       = tempfile.mkdtemp(prefix="goszakup_")
         input_file    = os.path.join(tmp_dir, "input.json")
         output_file   = os.path.join(tmp_dir, "output.json")

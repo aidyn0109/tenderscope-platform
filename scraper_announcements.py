@@ -24,6 +24,7 @@ import random
 import re
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable
 
 from playwright.sync_api import (
@@ -566,19 +567,19 @@ def collect_announcement_links(page: Page) -> list[dict]:
 
 # ---------------------------------------------------------------------------
 # Универсальный парсер вкладок: одним обходом DOM извлекаем
-#   • has_contracts (есть ли реальные записи во вкладке «Договоры»)
-#   • winner_text   (содержимое колонки «Победитель» из первой строки таблицы)
-#   • protocol_url  (href ссылки «Просмотреть протокол» — если есть в DOM)
-# Все три вкладки goszakup рендерятся в DOM сразу (Bootstrap-стиль), поэтому
-# кликать по вкладкам не нужно — экономим ~1–2 сек на каждое объявление.
+#   • hasContracts  — есть ли реальные записи во вкладке «Договоры»
+#   • winnerText    — текст ячейки «Победитель» (fallback на случай отсутствия ссылки)
+#   • winnerHref    — href ссылки в ячейке «Победитель» (страница участника)
+#   • protocolHref  — href кнопки «Просмотреть протокол» (HTML-файл протокола)
+# Все вкладки goszakup рендерятся в DOM сразу (Bootstrap), клики не нужны.
 # ---------------------------------------------------------------------------
 
 _PARSE_TABS_JS = r"""() => {
     const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
 
-    // Сопоставляем панели вкладок (.tab-pane / [role=tabpanel]) с подписями
-    // соответствующих ссылок (a[href="#id"], a[data-bs-target="#id"], ul.nav li a).
-    const panes = Array.from(document.querySelectorAll('.tab-pane, [role="tabpanel"], .tab-content > div'));
+    const panes = Array.from(document.querySelectorAll(
+        '.tab-pane, [role="tabpanel"], .tab-content > div'
+    ));
     const labelFor = (pane) => {
         const id = pane.id;
         if (!id) return '';
@@ -594,7 +595,6 @@ _PARSE_TABS_JS = r"""() => {
 
     const isContractsPane = (pane, label) => {
         if (label.includes('договор')) return true;
-        // Эвристика — если в панели нет явной метки, но видны характерные подписи
         const txt = norm(pane.innerText);
         return txt.includes('номер договора') && !txt.includes('победител');
     };
@@ -608,11 +608,11 @@ _PARSE_TABS_JS = r"""() => {
         for (const t of tables) {
             const bodyRows = t.tBodies[0] ? t.tBodies[0].rows : t.querySelectorAll('tr');
             for (const r of bodyRows) {
-                // Пропускаем заголовочные строки
                 if (r.querySelector('th') && r.cells.length === r.querySelectorAll('th').length) continue;
                 const txt = norm(r.innerText);
                 if (!txt) continue;
-                if (txt.includes('нет данных') || txt.includes('отсутству') || txt.includes('не найдено')) continue;
+                if (txt.includes('нет данных') || txt.includes('отсутству') ||
+                    txt.includes('не найдено')) continue;
                 if (r.cells.length > 0) return true;
             }
         }
@@ -631,29 +631,41 @@ _PARSE_TABS_JS = r"""() => {
             const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : Array.from(table.rows).slice(1);
             for (const r of bodyRows) {
                 if (r.cells.length <= winnerIdx) continue;
-                const t = (r.cells[winnerIdx].innerText || '').trim();
-                if (t) return t;
+                const cell = r.cells[winnerIdx];
+                const text = (cell.innerText || '').trim();
+                if (!text) continue;
+                const anchor = cell.querySelector("a[href]");
+                let href = anchor ? (anchor.getAttribute('href') || '') : '';
+                if (href && href.startsWith('javascript:')) href = '';
+                return { text: text, href: href };
             }
         }
         return null;
     };
 
-    const protocolUrlFromPane = (pane) => {
+    const protocolHrefFromPane = (pane) => {
         const anchors = pane.querySelectorAll('a');
         for (const a of anchors) {
             const t = norm(a.textContent);
             const href = a.getAttribute('href') || '';
             if (!href || href.startsWith('javascript:')) continue;
-            if (t.includes('просмотреть') || t.includes('протокол итогов') || href.includes('protokol')) {
+            if (t.includes('просмотреть') ||
+                t.includes('протокол итогов') ||
+                href.includes('protokol') ||
+                href.includes('p_itog')) {
                 return href;
             }
         }
         return null;
     };
 
-    const out = { hasContracts: false, winnerText: null, protocolUrl: null };
+    const out = {
+        hasContracts: false,
+        winnerText:   null,
+        winnerHref:   null,
+        protocolHref: null,
+    };
 
-    // Если панелей нет вовсе — пытаемся работать со всей страницей как одним «pane»
     const targets = panes.length ? panes : [document.body];
 
     for (const pane of targets) {
@@ -661,35 +673,74 @@ _PARSE_TABS_JS = r"""() => {
         if (panes.length && isContractsPane(pane, label)) {
             if (hasRealRows(pane)) out.hasContracts = true;
         }
-        if (panes.length && isWinnersPane(pane, label)) {
-            if (!out.winnerText) {
-                const w = winnerFromPane(pane);
-                if (w) out.winnerText = w;
-            }
+        if (panes.length && isWinnersPane(pane, label) && !out.winnerText) {
+            const w = winnerFromPane(pane);
+            if (w) { out.winnerText = w.text; out.winnerHref = w.href || null; }
         }
-        if (panes.length && isProtocolsPane(pane, label)) {
-            if (!out.protocolUrl) {
-                const u = protocolUrlFromPane(pane);
-                if (u) out.protocolUrl = u;
-            }
+        if (panes.length && isProtocolsPane(pane, label) && !out.protocolHref) {
+            const u = protocolHrefFromPane(pane);
+            if (u) out.protocolHref = u;
         }
     }
 
-    // Фолбэк: если не нашли по label-меткам, пройдёмся по всему документу
+    // Фолбэк: если по label-меткам ничего не нашли — обходим всю страницу
     if (!out.winnerText) {
         const w = winnerFromPane(document.body);
-        if (w) out.winnerText = w;
+        if (w) { out.winnerText = w.text; out.winnerHref = w.href || null; }
     }
-    if (!out.protocolUrl) {
-        const u = protocolUrlFromPane(document.body);
-        if (u) out.protocolUrl = u;
-    }
-    if (!out.hasContracts && panes.length === 0) {
-        // Никаких вкладок — ничего сказать не можем
-        out.hasContracts = false;
+    if (!out.protocolHref) {
+        const u = protocolHrefFromPane(document.body);
+        if (u) out.protocolHref = u;
     }
 
     return out;
+}"""
+
+
+# ---------------------------------------------------------------------------
+# Извлечение значений по подписи: ищем <td>label</td><td>value</td> или <dt><dd>
+# ---------------------------------------------------------------------------
+
+_EXTRACT_LABELS_JS = r"""(labels) => {
+    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+    const lcase = s => norm(s).toLowerCase();
+    const targets = new Map();
+    for (const lbl of labels) targets.set(lcase(lbl), lbl);
+
+    const result = {};
+
+    const tryAssign = (label, value) => {
+        const v = norm(value);
+        if (!v) return;
+        if (!result[label]) result[label] = v;
+    };
+
+    // td/th -> next td
+    for (const el of document.querySelectorAll('td, th')) {
+        const text = lcase(el.innerText);
+        if (!text) continue;
+        if (targets.has(text)) {
+            const next = el.nextElementSibling;
+            if (next) tryAssign(targets.get(text), next.innerText);
+            continue;
+        }
+        // Иногда метка может оканчиваться двоеточием
+        const noColon = text.replace(/[:：]$/, '').trim();
+        if (noColon !== text && targets.has(noColon)) {
+            const next = el.nextElementSibling;
+            if (next) tryAssign(targets.get(noColon), next.innerText);
+        }
+    }
+
+    // <dt><dd>
+    for (const dt of document.querySelectorAll('dt')) {
+        const text = lcase(dt.innerText);
+        if (!text || !targets.has(text)) continue;
+        const dd = dt.nextElementSibling;
+        if (dd && dd.tagName === 'DD') tryAssign(targets.get(text), dd.innerText);
+    }
+
+    return result;
 }"""
 
 
@@ -729,38 +780,166 @@ _PARSE_PROTOCOL_PRICE_JS = r"""(winnerBin) => {
 }"""
 
 
-def _fetch_protocol_price(page: Page, protocol_url: str, winner_bin: str) -> float:
-    """Открывает HTML протокола напрямую по URL и парсит цену поставщика."""
+def _fetch_winner_details(
+    context: BrowserContext,
+    winner_url: str,
+) -> tuple[str, str]:
+    """
+    Открывает страницу участника-победителя и достаёт:
+      • «Наименование на рус. языке»
+      • «БИН участника» (или похожие подписи: «БИН (ИНН)/ИНН/УНП», «БИН»)
+    """
+    if not winner_url:
+        return "", ""
+    absolute = winner_url if winner_url.startswith("http") else BASE_URL + winner_url
+
+    winner_page: Page | None = None
+    try:
+        winner_page = context.new_page()
+        _setup_page_routes(winner_page)
+        for attempt in range(1, RETRY_COUNT + 2):
+            try:
+                winner_page.goto(absolute, wait_until="domcontentloaded",
+                                 timeout=PLAYWRIGHT_CONFIG["timeout"])
+                break
+            except Exception as exc:
+                if attempt > RETRY_COUNT:
+                    logger.debug("Не удалось открыть страницу победителя %s: %s",
+                                 absolute, exc)
+                    return "", ""
+                time.sleep(1)
+
+        labels = [
+            "Наименование на рус. языке",
+            "Наименование на русском языке",
+            "БИН участника",
+            "БИН (ИНН)/ИНН/УНП",
+            "БИН/ИНН/УНП",
+            "БИН",
+        ]
+        try:
+            data = winner_page.evaluate(_EXTRACT_LABELS_JS, labels) or {}
+        except Exception as exc:
+            logger.debug("_EXTRACT_LABELS_JS error: %s", exc)
+            data = {}
+
+        name = (data.get("Наименование на рус. языке")
+                or data.get("Наименование на русском языке")
+                or "").strip()
+        bin_raw = (data.get("БИН участника")
+                   or data.get("БИН (ИНН)/ИНН/УНП")
+                   or data.get("БИН/ИНН/УНП")
+                   or data.get("БИН")
+                   or "")
+        bin_value = _extract_bin(bin_raw)
+
+        return name, bin_value
+
+    except Exception as exc:
+        logger.debug("_fetch_winner_details error: %s", exc)
+        return "", ""
+    finally:
+        if winner_page is not None:
+            try:
+                winner_page.close()
+            except Exception:
+                pass
+
+
+def _fetch_protocol_price(
+    context: BrowserContext,
+    protocol_url: str,
+    winner_bin: str,
+) -> float:
+    """
+    Извлекает «Цену поставщика» из протокола итогов.
+
+    Клик по «Просмотреть протокол» возвращает HTML с заголовком
+    Content-Disposition: attachment, поэтому браузер сохраняет файл, а не
+    отображает страницу. Используем Playwright's expect_download(), а потом
+    открываем сохранённый файл через file:// и применяем _PARSE_PROTOCOL_PRICE_JS.
+
+    Если по какой-то причине ответ оказался обычной HTML-страницей
+    (без attachment), парсер делает фолбэк на прямой goto.
+    """
     if not protocol_url or not winner_bin:
         return 0.0
     absolute = protocol_url if protocol_url.startswith("http") else BASE_URL + protocol_url
 
-    # Используем отдельную страницу-«разводной мост»: не ломаем основную page,
-    # с которой работает цикл по объявлениям.
-    protocol_page = None
-    try:
-        protocol_page = page.context.new_page()
-        _setup_page_routes(protocol_page)
-        for attempt in range(1, RETRY_COUNT + 2):
-            try:
-                protocol_page.goto(absolute, wait_until="domcontentloaded",
-                                   timeout=PLAYWRIGHT_CONFIG["timeout"])
-                break
-            except Exception as exc:
-                if attempt > RETRY_COUNT:
-                    logger.debug("Не удалось открыть протокол %s: %s", absolute, exc)
-                    return 0.0
-                time.sleep(1)
+    saved_path: str | None = None
 
-        raw_price = protocol_page.evaluate(_PARSE_PROTOCOL_PRICE_JS, winner_bin)
+    # ── Попытка 1: захватить скачивание ────────────────────────────────────
+    dl_page: Page | None = None
+    try:
+        dl_page = context.new_page()
+        try:
+            with dl_page.expect_download(timeout=20_000) as dl_info:
+                try:
+                    dl_page.goto(absolute, timeout=PLAYWRIGHT_CONFIG["timeout"])
+                except Exception:
+                    # Навигация прерывается, когда сервер возвращает
+                    # Content-Disposition: attachment — это нормально.
+                    pass
+            download = dl_info.value
+            try:
+                saved_path = download.path()
+            except Exception as exc:
+                logger.debug("download.path() failed: %s", exc)
+                saved_path = None
+        except Exception:
+            saved_path = None
+    finally:
+        if dl_page is not None:
+            try:
+                dl_page.close()
+            except Exception:
+                pass
+
+    # ── Парсинг скачанного HTML файла ──────────────────────────────────────
+    if saved_path:
+        try:
+            file_uri = Path(saved_path).resolve().as_uri()
+        except Exception:
+            file_uri = None
+
+        parser_page: Page | None = None
+        try:
+            parser_page = context.new_page()
+            if file_uri:
+                parser_page.goto(file_uri, wait_until="domcontentloaded",
+                                 timeout=PLAYWRIGHT_CONFIG["timeout"])
+            else:
+                with open(saved_path, encoding="utf-8", errors="replace") as f:
+                    parser_page.set_content(f.read(), wait_until="domcontentloaded")
+            raw_price = parser_page.evaluate(_PARSE_PROTOCOL_PRICE_JS, winner_bin)
+            if raw_price:
+                return _parse_amount(raw_price)
+        except Exception as exc:
+            logger.debug("Ошибка парсинга скачанного протокола %s: %s",
+                         saved_path, exc)
+        finally:
+            if parser_page is not None:
+                try:
+                    parser_page.close()
+                except Exception:
+                    pass
+
+    # ── Фолбэк: вдруг это всё-таки обычная страница ────────────────────────
+    fb_page: Page | None = None
+    try:
+        fb_page = context.new_page()
+        _setup_page_routes(fb_page)
+        fb_page.goto(absolute, wait_until="domcontentloaded",
+                     timeout=PLAYWRIGHT_CONFIG["timeout"])
+        raw_price = fb_page.evaluate(_PARSE_PROTOCOL_PRICE_JS, winner_bin)
         return _parse_amount(raw_price) if raw_price else 0.0
     except Exception as exc:
-        logger.debug("_fetch_protocol_price error: %s", exc)
+        logger.debug("Fallback _fetch_protocol_price error: %s", exc)
         return 0.0
     finally:
-        if protocol_page is not None:
+        if fb_page is not None:
             try:
-                protocol_page.close()
+                fb_page.close()
             except Exception:
                 pass
 
@@ -769,11 +948,18 @@ def parse_announcement(page: Page, ann_data: dict, index: int) -> AnnouncementRe
     """
     Парсит одно объявление:
       1. Открывает страницу объявления.
-      2. Одним JS-обходом DOM извлекает has_contracts, текст победителя
-         и URL «Просмотреть протокол» из всех вкладок (Bootstrap-табы рендерятся
-         в DOM сразу — клики не нужны).
-      3. Если has_contracts=True → цена остаётся 0 (по ТЗ оставляем пустой),
-         иначе → загружаем HTML протокола и парсим «Цену поставщика» по БИН.
+      2. Одним JS-обходом DOM извлекает:
+           • has_contracts          — есть ли записи во вкладке «Договоры»;
+           • ссылку на победителя   — href из ячейки «Победитель»;
+           • ссылку на протокол     — href «Просмотреть протокол».
+      3. Переходит по ссылке победителя и парсит:
+           • «Наименование на рус. языке»
+           • «БИН участника»
+      4. Если has_contracts=True   → цена остаётся пустой (по ТЗ),
+         иначе                     → скачивает HTML протокола итогов через
+                                      expect_download() и достаёт цену поставщика
+                                      по БИН победителя из таблицы
+                                      «Расчет условных цен участников конкурса».
     """
     url = ann_data["url"]
     number_str = (ann_data.get("number") or "").strip()
@@ -813,20 +999,41 @@ def parse_announcement(page: Page, ann_data: dict, index: int) -> AnnouncementRe
         tabs_data = {}
 
     has_contracts = bool(tabs_data.get("hasContracts"))
-    winner_text = tabs_data.get("winnerText") or ""
-    protocol_url = tabs_data.get("protocolUrl") or ""
+    winner_text   = tabs_data.get("winnerText") or ""
+    winner_href   = tabs_data.get("winnerHref") or ""
+    protocol_href = tabs_data.get("protocolHref") or ""
 
     record.has_contracts = has_contracts
 
-    if winner_text:
-        winner_bin = _extract_bin(winner_text)
-        record.winner_bin = winner_bin
-        record.winner_name = _clean_company_name(winner_text, winner_bin)
+    # ── Победитель: открываем страницу участника по ссылке из ячейки «Победитель»
+    if winner_href:
+        try:
+            w_name, w_bin = _fetch_winner_details(page.context, winner_href)
+        except Exception as exc:
+            logger.debug("Ошибка _fetch_winner_details: %s", exc)
+            w_name, w_bin = "", ""
+        record.winner_name = w_name
+        record.winner_bin = w_bin
 
-    if not has_contracts and record.winner_bin and protocol_url:
-        record.winner_price = _fetch_protocol_price(page, protocol_url, record.winner_bin)
+    # Фолбэк: парсим прямо из текста ячейки, если страница победителя не открылась
+    if not record.winner_bin and winner_text:
+        bin_fb = _extract_bin(winner_text)
+        if bin_fb:
+            record.winner_bin = bin_fb
+        if not record.winner_name:
+            record.winner_name = _clean_company_name(winner_text, bin_fb)
 
-    if not record.winner_bin:
+    # ── Цена: скачиваем HTML протокола итогов через expect_download
+    if not has_contracts and record.winner_bin and protocol_href:
+        try:
+            record.winner_price = _fetch_protocol_price(
+                page.context, protocol_href, record.winner_bin
+            )
+        except Exception as exc:
+            logger.debug("Ошибка _fetch_protocol_price: %s", exc)
+            record.winner_price = 0.0
+
+    if not record.winner_bin and not record.winner_name:
         record.error = "Победитель не найден"
 
     return record
