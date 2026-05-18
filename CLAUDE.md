@@ -35,12 +35,24 @@ goszakup_platform/
 | Компонент | Библиотека / Инструмент                                                                            |
 | ------------------ | ---------------------------------------------------------------------------------------------------------------------- |
 | UI                 | `streamlit`                                                                                                          |
-| Парсинг     | `playwright` (async, headless)                                                                                       |
+| Парсинг     | `requests` + GraphQL API goszakup.gov.kz (Bearer-токен)                                                              |
 | Excel              | `openpyxl`                                                                                                           |
 | Прогресс   | `st.progress` + `st.status`                                                                                        |
 | ИИ агент    | Claude API (`claude-sonnet-4-20250514`) — опционально для извлечения данных из HTML |
 
-> **Примечание:** Playwright предпочтительнее Selenium — он стабильнее работает с динамическим JS-контентом сайта госзакупок.
+> **Примечание:** Используется официальный GraphQL API сайта госзакупок — никакого headless-браузера не требуется.
+
+## Конфигурация API
+
+| Параметр | Значение |
+|----------|----------|
+| Договоры endpoint | https://ows.goszakup.gov.kz/v2/graphql |
+| Объявления endpoint | https://ows.goszakup.gov.kz/v3/graphql |
+| Авторизация | Bearer токен |
+| Переменная окружения | GOSZAKUP_TOKEN |
+| SSL | verify=False (казахстанский сертификат) |
+| Лимит на запрос | 50 записей |
+| Пагинация | через extensions.pageInfo.lastId |
 
 ---
 

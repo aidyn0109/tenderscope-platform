@@ -1,49 +1,41 @@
 """
-scraper.py — Логика парсинга goszakup.gov.kz
-Использует синхронный Playwright API (sync_playwright).
+scraper.py — Логика парсинга реестра договоров goszakup.gov.kz через GraphQL API v2.
+
+Прямые HTTPS-запросы к https://ows.goszakup.gov.kz/v2/graphql.
+Авторизация — Bearer-токен из env GOSZAKUP_TOKEN или st.secrets["goszakup_token"].
 """
 
 import logging
-import random
-import re
+import os
 import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    sync_playwright,
-)
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+try:  # streamlit может быть недоступен в subprocess-окружении
+    import streamlit as st  # type: ignore
+except Exception:  # noqa: BLE001
+    st = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-PLAYWRIGHT_CONFIG = {
-    "headless": True,
-    "timeout": 90_000,
-    "viewport": {"width": 1280, "height": 800},
-    "locale": "ru-RU",
-    "user_agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-}
+GRAPHQL_ENDPOINT = "https://ows.goszakup.gov.kz/v2/graphql"
+REQUEST_TIMEOUT = 60
+RETRY_COUNT = 2
+RETRY_DELAY = 3
+PAGE_LIMIT = 50
+MAX_RECORDS = 10_000
 
-BASE_URL     = "https://goszakup.gov.kz"
-REGISTRY_URL = f"{BASE_URL}/ru/registry/contract"
+CONTRACT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/egzcontract/cpublic/show/{id}"
 
 # 190 = Действует, 460 = Передан.Действует, 450 = Создано доп.соглашение
-TARGET_STATUS_VALUES = ["190", "460", "450"]
-
-# Ресурсы, которые блокируем — не нужны для парсинга, экономят время
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-
-REQUEST_DELAY = 0.3   # задержка между договорами (сек)
-RETRY_COUNT   = 2
+TARGET_STATUS_IDS = [190, 460, 450]
 
 logger = logging.getLogger(__name__)
 
@@ -75,265 +67,198 @@ class ScrapeResult:
 ProgressCallback = Callable[[int, int, str], None]
 RecordCallback   = Callable[["ContractRecord"], None]
 
-PAGE_RECYCLE_INTERVAL = 5  # Переоткрываем страницу каждые N договоров → освобождаем память
-
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции
+# Токен авторизации
 # ---------------------------------------------------------------------------
 
-def _parse_amount(raw: str) -> float:
-    if not raw:
-        return 0.0
-    cleaned = re.sub(r"[^\d,\.]", "", raw.replace("\xa0", "").replace(" ", ""))
-    cleaned = cleaned.replace(",", ".")
-    parts = cleaned.split(".")
-    if len(parts) > 2:
-        cleaned = "".join(parts[:-1]) + "." + parts[-1]
-    try:
-        return float(cleaned)
-    except ValueError:
-        logger.warning("Не удалось распарсить сумму: %r", raw)
-        return 0.0
-
-
-def _random_delay(base: float = REQUEST_DELAY) -> None:
-    """Случайная задержка ±30% от base для имитации человека."""
-    time.sleep(base * random.uniform(0.7, 1.3))
-
-
-def _setup_page_routes(page: Page) -> None:
-    """Блокирует ненужные ресурсы для ускорения загрузки."""
-    page.route(
-        "**/*",
-        lambda route: (
-            route.abort()
-            if route.request.resource_type in BLOCKED_RESOURCE_TYPES
-            else route.continue_()
-        ),
-    )
-
-
-# ---------------------------------------------------------------------------
-# Навигация к реестру договоров
-# ---------------------------------------------------------------------------
-
-def navigate_to_registry(page: Page) -> None:
-    logger.info("Переходим на реестр договоров: %s", REGISTRY_URL)
-    _setup_page_routes(page)
-    for attempt in range(1, 4):
+def _get_token() -> str:
+    """Читает Bearer-токен из env или st.secrets. Иначе RuntimeError."""
+    token = (os.environ.get("GOSZAKUP_TOKEN") or "").strip()
+    if token:
+        return token
+    if st is not None:
         try:
-            page.goto(REGISTRY_URL, wait_until="domcontentloaded",
-                      timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(600)
-            logger.info("Реестр загружен (попытка %d). URL: %s", attempt, page.url)
-            return
-        except Exception as exc:
-            logger.warning("navigate_to_registry попытка %d/3: %s", attempt, exc)
-            if attempt == 3:
-                raise
-            logger.info("Повтор через 5 сек...")
-            time.sleep(5)
-
-
-# ---------------------------------------------------------------------------
-# Применение фильтров
-# ---------------------------------------------------------------------------
-
-def apply_filters(page: Page, bin_number: str) -> None:
-    logger.info("Применяем фильтры для БИН: %s", bin_number)
-
-    supplier_input = page.locator("#in_supplier")
-    supplier_input.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    supplier_input.fill(bin_number)
-    page.wait_for_timeout(150)
-
-    page.evaluate(
-        """(values) => {
-            const sel = document.querySelector("select[name='filter[status][]']");
-            if (!sel) return;
-            if (window.jQuery) {
-                jQuery(sel).val(values).trigger('change');
-            } else {
-                Array.from(sel.options).forEach(opt => {
-                    opt.selected = values.includes(opt.value);
-                });
-            }
-        }""",
-        TARGET_STATUS_VALUES,
+            secret = st.secrets.get("goszakup_token")  # type: ignore[attr-defined]
+            if secret:
+                secret = str(secret).strip()
+                if secret:
+                    return secret
+        except Exception:  # noqa: BLE001
+            pass
+    raise RuntimeError(
+        "Токен Goszakup API не найден. Установите переменную окружения "
+        "GOSZAKUP_TOKEN или ключ st.secrets['goszakup_token']."
     )
-    page.wait_for_timeout(200)
-
-    search_btn = page.locator("button[type='submit']").first
-    search_btn.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    search_btn.click()
-    page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(600)
-
-    logger.info("Фильтры применены. URL: %s", page.url)
 
 
 # ---------------------------------------------------------------------------
-# Сбор ссылок на договоры (с пагинацией)
+# GraphQL запрос
 # ---------------------------------------------------------------------------
 
-def collect_contract_links(page: Page) -> list[str]:
-    links: list[str] = []
-    page_num = 1
+_CONTRACT_QUERY = """
+query($filter: ContractFiltersInput, $after: Int) {
+  contract(limit: 50, after: $after, filters: $filter) {
+    id
+    contract_number_sys
+    description_ru
+    contract_sum_wnds
+    fakt_sum_wnds
+    ref_contract_status_id
+    supplier_biin
+    sign_date
+    ec_end_date
+  }
+}
+"""
+
+
+def _graphql_request(token: str, variables: dict) -> dict:
+    """Выполняет POST к GraphQL endpoint с retry. Возвращает распарсенный JSON."""
+    payload = {"query": _CONTRACT_QUERY, "variables": variables}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    last_exc: Exception | None = None
+    for attempt in range(RETRY_COUNT + 1):
+        try:
+            resp = requests.post(
+                GRAPHQL_ENDPOINT,
+                json=payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+                verify=False,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning("GraphQL contract запрос попытка %d/%d: %s",
+                           attempt + 1, RETRY_COUNT + 1, exc)
+            if attempt < RETRY_COUNT:
+                time.sleep(RETRY_DELAY)
+    raise RuntimeError(f"GraphQL запрос завершился ошибкой: {last_exc}")
+
+
+# ---------------------------------------------------------------------------
+# Форматирование
+# ---------------------------------------------------------------------------
+
+def _format_date(s: str | None) -> str:
+    """Парсит дату YYYY-MM-DD[ HH:MM:SS] → DD.MM.YYYY. Пустая строка/исключение → ''. """
+    if not s:
+        return ""
+    head = str(s).strip()[:10]
+    try:
+        y, m, d = head.split("-")
+        return f"{int(d):02d}.{int(m):02d}.{int(y):04d}"
+    except Exception:  # noqa: BLE001
+        return str(s).strip()
+
+
+def _format_validity_period(sign_date: str | None, end_date: str | None) -> str:
+    a = _format_date(sign_date)
+    b = _format_date(end_date)
+    if a and b:
+        return f"{a} — {b}"
+    return a or b or ""
+
+
+def _to_float(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _contract_record_from_item(item: dict, bin_number: str) -> ContractRecord:
+    cid = item.get("id")
+    amount_final = _to_float(item.get("contract_sum_wnds"))
+    amount_actual = _to_float(item.get("fakt_sum_wnds"))
+    description = (item.get("description_ru") or "").strip() or "(описание отсутствует)"
+    url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
+    return ContractRecord(
+        bin=(item.get("supplier_biin") or bin_number),
+        contract_number=(item.get("contract_number_sys") or "").strip(),
+        description=description,
+        validity_period=_format_validity_period(
+            item.get("sign_date"), item.get("ec_end_date")
+        ),
+        amount_final=amount_final,
+        amount_actual=amount_actual,
+        difference=round(amount_final - amount_actual, 2),
+        url=url,
+        error="",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Сбор всех договоров для одного БИН (с пагинацией)
+# ---------------------------------------------------------------------------
+
+def _fetch_contracts_for_bin(
+    token: str,
+    bin_number: str,
+    errors_sink: list[str],
+) -> list[dict]:
+    items: list[dict] = []
+    after: int | None = None
+    filter_input = {
+        "supplier_biin": bin_number,
+        "ref_contract_status_id": TARGET_STATUS_IDS,
+    }
 
     while True:
-        logger.info("Сбор ссылок — страница %d", page_num)
+        variables: dict = {"filter": filter_input}
+        if after is not None:
+            variables["after"] = after
 
-        anchors  = page.locator("a[href*='/egzcontract/cpublic/show/']")
-        count    = anchors.count()
-        new_count = 0
-
-        for i in range(count):
-            href = anchors.nth(i).get_attribute("href")
-            if href:
-                absolute = href if href.startswith("http") else BASE_URL + href
-                if absolute not in links:
-                    links.append(absolute)
-                    new_count += 1
-
-        logger.info("Страница %d: %d новых ссылок (всего: %d)", page_num, new_count, len(links))
-
-        if new_count == 0:
-            break
-
-        next_li = page.locator(".pagination li").filter(has_text="»").first
-        if not next_li.count():
-            break
-
-        is_disabled = next_li.evaluate(
-            "el => el.classList.contains('disabled') || el.classList.contains('active')"
-        )
-        if is_disabled:
-            break
-
-        first_href_before = links[-(new_count)] if new_count else None
-
-        next_li.locator("a").first.click()
-        page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-        page.wait_for_timeout(500)
-
-        first_anchor = page.locator("a[href*='/egzcontract/cpublic/show/']").first
-        if first_anchor.count():
-            first_href_after = first_anchor.get_attribute("href")
-            if first_href_after and (
-                first_href_after == first_href_before
-                or first_href_after in links
-            ):
-                break
-        else:
-            break
-
-        page_num += 1
-        if page_num > 100:
-            break
-
-        _random_delay(0.3)
-
-    logger.info("Всего ссылок: %d", len(links))
-    return links
-
-
-# ---------------------------------------------------------------------------
-# Парсинг одного договора
-# ---------------------------------------------------------------------------
-
-# Все нужные поля в одном JS-запросе — единственный обход DOM вместо 5 отдельных
-_EXTRACT_JS = """(labels) => {
-    const result = {};
-    for (const td of document.querySelectorAll("td")) {
-        const text = td.innerText.trim();
-        if (labels.includes(text)) {
-            const next = td.nextElementSibling;
-            if (next) result[text] = next.innerText.trim();
-        }
-    }
-    return result;
-}"""
-
-_CONTRACT_FIELDS = [
-    "Номер основного договора в реестре договоров",
-    "Краткое содержание договора на русском языке",
-    "Срок действия договора",
-    "Общая итоговая сумма договора",
-    "Общая фактическая сумма договора",
-]
-
-
-def parse_contract(page: Page, url: str, bin_number: str) -> ContractRecord:
-    for attempt in range(1, RETRY_COUNT + 2):
         try:
-            page.goto(url, wait_until="domcontentloaded",
-                      timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(150)
+            response = _graphql_request(token, variables)
+        except Exception as exc:  # noqa: BLE001
+            errors_sink.append(f"БИН {bin_number}: {exc}")
+            break
 
-            data = page.evaluate(_EXTRACT_JS, _CONTRACT_FIELDS)
+        gql_errors = response.get("errors")
+        if gql_errors:
+            msg = "; ".join(str(e.get("message", e)) for e in gql_errors)
+            errors_sink.append(f"GraphQL error: {msg}")
+            break
 
-            contract_number   = data.get("Номер основного договора в реестре договоров", "")
-            description       = data.get("Краткое содержание договора на русском языке", "")
-            validity_period   = data.get("Срок действия договора", "")
-            amount_str_final  = data.get("Общая итоговая сумма договора", "")
-            amount_str_actual = data.get("Общая фактическая сумма договора", "")
+        data = response.get("data") or {}
+        batch = data.get("contract") or []
+        items.extend(batch)
 
-            amount_final  = _parse_amount(amount_str_final)
-            amount_actual = _parse_amount(amount_str_actual)
+        page_info = (response.get("extensions") or {}).get("pageInfo") or {}
+        has_next = bool(page_info.get("hasNextPage"))
+        last_id = page_info.get("lastId")
 
-            return ContractRecord(
-                bin=bin_number,
-                contract_number=contract_number,
-                description=description or "(описание отсутствует)",
-                validity_period=validity_period,
-                amount_final=amount_final,
-                amount_actual=amount_actual,
-                difference=round(amount_final - amount_actual, 2),
-                url=url,
-                error="" if (amount_str_final and amount_str_actual) else "Сумма не найдена",
-            )
+        if not batch or not has_next or last_id is None or len(items) >= MAX_RECORDS:
+            break
+        after = last_id
 
-        except Exception as exc:
-            logger.warning("Попытка %d/%d для %s: %s", attempt, RETRY_COUNT + 1, url, exc)
-            if attempt > RETRY_COUNT:
-                return ContractRecord(
-                    bin=bin_number,
-                    contract_number="",
-                    description="",
-                    validity_period="",
-                    amount_final=0.0,
-                    amount_actual=0.0,
-                    difference=0.0,
-                    url=url,
-                    error=f"Ошибка загрузки: {exc}",
-                )
-            time.sleep(2)
+    return items
 
 
 # ---------------------------------------------------------------------------
-# Парсинг одного БИН (sequential — Playwright sync API не thread-safe)
+# scrape_bin / scrape_all
 # ---------------------------------------------------------------------------
 
 def scrape_bin(
     bin_number: str,
-    context: BrowserContext,
-    progress_cb: ProgressCallback | None = None,
-    on_record: "RecordCallback | None" = None,
+    token: str,
+    on_contract_progress: ProgressCallback | None = None,
+    on_record: RecordCallback | None = None,
 ) -> ScrapeResult:
     result = ScrapeResult(bin=bin_number)
 
-    # Отдельная страница для навигации и сбора ссылок
-    nav_page = context.new_page()
-    _setup_page_routes(nav_page)
-    try:
-        navigate_to_registry(nav_page)
-        apply_filters(nav_page, bin_number)
-        links = collect_contract_links(nav_page)
-    finally:
-        nav_page.close()  # сразу освобождаем память навигационной страницы
+    items = _fetch_contracts_for_bin(token, bin_number, result.errors)
 
-    if not links:
+    if not items:
         result.records.append(ContractRecord(
             bin=bin_number,
             contract_number="",
@@ -347,128 +272,50 @@ def scrape_bin(
         ))
         return result
 
-    total        = len(links)
-    contract_page = context.new_page()
-    _setup_page_routes(contract_page)
-
-    try:
-        for idx, url in enumerate(links, start=1):
-            if progress_cb:
-                progress_cb(idx, total, f"Договор {idx} из {total}")
-
-            # Переоткрываем страницу каждые N договоров — очищаем накопленную память
-            if idx > 1 and (idx - 1) % PAGE_RECYCLE_INTERVAL == 0:
-                contract_page.close()
-                contract_page = context.new_page()
-                _setup_page_routes(contract_page)
-                logger.info("Страница переоткрыта после договора %d", idx - 1)
-
+    total = len(items)
+    for idx, item in enumerate(items, start=1):
+        if on_contract_progress:
             try:
-                record = parse_contract(contract_page, url, bin_number)
-            except Exception as exc:
-                logger.error("Необработанная ошибка договора %s: %s", url, exc)
-                record = ContractRecord(
-                    bin=bin_number,
-                    contract_number="",
-                    description="",
-                    validity_period="",
-                    amount_final=0.0,
-                    amount_actual=0.0,
-                    difference=0.0,
-                    url=url,
-                    error=f"Критическая ошибка: {exc}",
-                )
+                on_contract_progress(idx, total, f"Договор {idx} из {total}")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_contract_progress callback error: %s", exc)
 
-            result.records.append(record)
+        record = _contract_record_from_item(item, bin_number)
+        result.records.append(record)
 
-            if on_record:
-                try:
-                    on_record(record)  # немедленно сохраняем на диск
-                except Exception as exc:
-                    logger.warning("on_record callback error: %s", exc)
-
-            if record.error:
-                result.errors.append(f"{url}: {record.error}")
-
-            _random_delay(REQUEST_DELAY)
-
-    except Exception as exc:
-        logger.error("Критическая ошибка при обработке БИН %s: %s", bin_number, exc)
-        result.errors.append(str(exc))
-    finally:
-        try:
-            contract_page.close()
-        except Exception:
-            pass
+        if on_record:
+            try:
+                on_record(record)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_record callback error: %s", exc)
 
     return result
 
-
-# ---------------------------------------------------------------------------
-# Batch-запуск нескольких БИН (синхронный)
-# ---------------------------------------------------------------------------
 
 def scrape_all(
     bin_list: list[str],
     on_bin_start: Callable[[int, int, str], None] | None = None,
     on_contract_progress: ProgressCallback | None = None,
-    on_record: "RecordCallback | None" = None,
+    on_record: RecordCallback | None = None,
 ) -> list[ScrapeResult]:
+    token = _get_token()
     results: list[ScrapeResult] = []
+    total_bins = len(bin_list)
 
-    with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(
-            headless=PLAYWRIGHT_CONFIG["headless"],
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                # Безопасность / sandbox (обязательно на Render)
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                # Память — самое важное для Render free tier (512MB)
-                "--disable-dev-shm-usage",   # не использовать /dev/shm (мало места)
-                "--disable-gpu",             # GPU не нужен в headless
-                "--no-zygote",               # убирает лишний форк-процесс
-                # Отключаем всё лишнее
-                "--disable-extensions",
-                "--disable-background-networking",
-                "--disable-background-timer-throttling",
-                "--disable-client-side-phishing-detection",
-                "--disable-default-apps",
-                "--disable-hang-monitor",
-                "--disable-sync",
-                "--metrics-recording-only",
-                "--mute-audio",
-                "--no-first-run",
-                "--safebrowsing-disable-auto-update",
-            ],
+    for i, bin_number in enumerate(bin_list, start=1):
+        if on_bin_start:
+            try:
+                on_bin_start(i, total_bins, bin_number)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_bin_start callback error: %s", exc)
+
+        logger.info("=== Обработка БИН %s (%d/%d) ===", bin_number, i, total_bins)
+        result = scrape_bin(
+            bin_number, token,
+            on_contract_progress=on_contract_progress,
+            on_record=on_record,
         )
-        context: BrowserContext = browser.new_context(
-            viewport=PLAYWRIGHT_CONFIG["viewport"],
-            locale=PLAYWRIGHT_CONFIG["locale"],
-            user_agent=PLAYWRIGHT_CONFIG["user_agent"],
-            extra_http_headers={
-                "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept": (
-                    "text/html,application/xhtml+xml,application/xml;"
-                    "q=0.9,image/webp,*/*;q=0.8"
-                ),
-            },
-        )
-        context.set_default_timeout(PLAYWRIGHT_CONFIG["timeout"])
-
-        try:
-            total_bins = len(bin_list)
-            for i, bin_number in enumerate(bin_list, start=1):
-                if on_bin_start:
-                    on_bin_start(i, total_bins, bin_number)
-
-                logger.info("=== Обработка БИН %s (%d/%d) ===", bin_number, i, total_bins)
-                result = scrape_bin(bin_number, context, on_contract_progress, on_record)
-                results.append(result)
-
-        finally:
-            context.close()
-            browser.close()
+        results.append(result)
 
     return results
 

@@ -1,71 +1,60 @@
 """
-scraper_announcements.py — Логика парсинга закупочных объявлений с goszakup.gov.kz
+scraper_announcements.py — Парсинг закупочных объявлений через GraphQL API v3.
 
-Алгоритм:
-1. Открыть https://goszakup.gov.kz/ → Закупки → Поиск объявлений
-2. Установить фильтры:
-     • Статус: «Завершено» и «Формирование протокола итогов»
-     • Предмет закупки: «Работа»
-     • Сумма закупки с: 1 500 000 000
-     • Окончание приема заявок с: дата, выбранная пользователем
-3. Нажать «Найти» и собрать все объявления (с пагинацией).
-4. Для каждого объявления:
-     • открыть страницу;
-     • из вкладки «Информация о победителях» извлечь БИН и наименование;
-     • если во вкладке «Договоры» нет данных — открыть «Протокол итогов»
-       и извлечь «Цена поставщика» по БИН победителя;
-     • если данные в «Договоры» есть — оставить цену пустой (0.0).
-
-Использует синхронный Playwright API (sync_playwright).
+Все данные тянутся прямыми HTTPS-запросами к
+https://ows.goszakup.gov.kz/v3/graphql (объявления и лоты) и
+https://ows.goszakup.gov.kz/v2/graphql (договоры).
+Авторизация — Bearer-токен из env GOSZAKUP_TOKEN или st.secrets["goszakup_token"].
 """
 
 import logging
-import random
-import re
+import os
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Callable
 
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    sync_playwright,
-)
+import requests
+import urllib3
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+try:  # streamlit может быть недоступен в subprocess-окружении
+    import streamlit as st  # type: ignore
+except Exception:  # noqa: BLE001
+    st = None  # type: ignore
 
 # ---------------------------------------------------------------------------
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-PLAYWRIGHT_CONFIG = {
-    "headless": True,
-    "timeout": 90_000,
-    "viewport": {"width": 1280, "height": 800},
-    "locale": "ru-RU",
-    "user_agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
+GRAPHQL_V3_ENDPOINT = "https://ows.goszakup.gov.kz/v3/graphql"
+GRAPHQL_V2_ENDPOINT = "https://ows.goszakup.gov.kz/v2/graphql"
+REQUEST_TIMEOUT = 60
+RETRY_COUNT = 2
+RETRY_DELAY = 3
+PAGE_LIMIT = 50
+MAX_RECORDS = 10_000
+
+ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
+
+# 210 = Завершено, 220 = Формирование протокола итогов
+TARGET_STATUS_IDS = [210, 220]
+STATUS_MAP = {
+    210: "Завершено",
+    220: "Формирование протокола итогов",
 }
 
-BASE_URL = "https://goszakup.gov.kz"
-ANNOUNCEMENTS_URL = f"{BASE_URL}/ru/search/announce"
+# 2 = Работа
+TARGET_SUBJECT_IDS = [2]
 
-# Минимальная сумма закупки (тг)
-MIN_PURCHASE_SUM = "1500000000"
+MIN_SUM_AMOUNT = 1_500_000_000
 
-# Целевые статусы, выбираемые по видимому тексту опции
-TARGET_STATUS_TEXTS = ["Завершено", "Формирование протокола итогов"]
-# Целевой предмет закупки
-TARGET_SUBJECT_TEXT = "Работа"
-
-BLOCKED_RESOURCE_TYPES = {"image", "media", "font"}
-
-REQUEST_DELAY = 0.15
-RETRY_COUNT = 2
-PAGE_RECYCLE_INTERVAL = 10
+METHOD_MAP = {
+    1: "Конкурс",
+    2: "Аукцион",
+    3: "Запрос ценовых предложений",
+    4: "Из одного источника",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -103,940 +92,298 @@ RecordCallback = Callable[["AnnouncementRecord"], None]
 
 
 # ---------------------------------------------------------------------------
-# Вспомогательные функции
+# Токен авторизации
 # ---------------------------------------------------------------------------
 
-def _parse_amount(raw: str) -> float:
-    if not raw:
-        return 0.0
-    cleaned = re.sub(r"[^\d,\.]", "", raw.replace("\xa0", "").replace(" ", ""))
-    cleaned = cleaned.replace(",", ".")
-    parts = cleaned.split(".")
-    if len(parts) > 2:
-        cleaned = "".join(parts[:-1]) + "." + parts[-1]
-    try:
-        return float(cleaned)
-    except ValueError:
-        logger.warning("Не удалось распарсить сумму: %r", raw)
-        return 0.0
-
-
-def _random_delay(base: float = REQUEST_DELAY) -> None:
-    time.sleep(base * random.uniform(0.7, 1.3))
-
-
-def _setup_page_routes(page: Page) -> None:
-    page.route(
-        "**/*",
-        lambda route: (
-            route.abort()
-            if route.request.resource_type in BLOCKED_RESOURCE_TYPES
-            else route.continue_()
-        ),
-    )
-
-
-def _extract_bin(text: str) -> str:
-    m = re.search(r"\b\d{12}\b", text or "")
-    return m.group(0) if m else ""
-
-
-def _clean_company_name(text: str, bin_value: str) -> str:
-    """Удаляет БИН и служебные подстроки, возвращая чистое наименование."""
-    if not text:
-        return ""
-    name = text
-    if bin_value:
-        name = name.replace(bin_value, "")
-    # Убираем переносы / лишние пробелы
-    name = re.sub(r"\s+", " ", name)
-    # Убираем хвосты вида "БИН:", "ИНН/УНП:"
-    name = re.sub(r"\b(БИН|ИНН|УНП|БИН/ИНН|ИНН/УНП)\s*[:№]?\s*", "", name, flags=re.I)
-    return name.strip(" ,.;:-")
-
-
-# ---------------------------------------------------------------------------
-# Навигация
-# ---------------------------------------------------------------------------
-
-def navigate_to_announcements(page: Page) -> None:
-    logger.info("Переходим к поиску объявлений: %s", ANNOUNCEMENTS_URL)
-    _setup_page_routes(page)
-    for attempt in range(1, 4):
+def _get_token() -> str:
+    token = (os.environ.get("GOSZAKUP_TOKEN") or "").strip()
+    if token:
+        return token
+    if st is not None:
         try:
-            page.goto(ANNOUNCEMENTS_URL, wait_until="domcontentloaded",
-                      timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(700)
-            logger.info("Страница поиска объявлений загружена (попытка %d). URL: %s",
-                        attempt, page.url)
-            return
-        except Exception as exc:
-            logger.warning("navigate_to_announcements попытка %d/3: %s", attempt, exc)
-            if attempt == 3:
-                raise
-            time.sleep(5)
-
-
-# ---------------------------------------------------------------------------
-# Установка фильтров
-# ---------------------------------------------------------------------------
-
-_SELECT_BY_TEXT_JS = """({selector, targets, exact}) => {
-    const sel = document.querySelector(selector);
-    if (!sel) return false;
-    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const wanted = targets.map(norm);
-    let changed = 0;
-    Array.from(sel.options).forEach(opt => {
-        const t = norm(opt.textContent);
-        const match = wanted.some(w => exact ? t === w : (t === w || t.includes(w)));
-        opt.selected = match;
-        if (match) changed += 1;
-    });
-    if (window.jQuery) {
-        jQuery(sel).trigger('change');
-    } else {
-        sel.dispatchEvent(new Event('change', {bubbles: true}));
-    }
-    return changed > 0;
-}"""
-
-
-_FILL_INPUT_BY_LABEL_JS = """({labelText, value}) => {
-    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const target = norm(labelText);
-
-    const findInputNear = (el) => {
-        if (!el) return null;
-        // 1) label[for=...]
-        if (el.htmlFor) {
-            const byId = document.getElementById(el.htmlFor);
-            if (byId && (byId.tagName === 'INPUT' || byId.tagName === 'SELECT')) return byId;
-        }
-        // 2) input внутри
-        const inner = el.querySelector('input:not([type="hidden"])');
-        if (inner) return inner;
-        // 3) input в соседних элементах
-        let sib = el.nextElementSibling;
-        while (sib) {
-            if (sib.tagName === 'INPUT') return sib;
-            const innerSib = sib.querySelector('input:not([type="hidden"])');
-            if (innerSib) return innerSib;
-            sib = sib.nextElementSibling;
-        }
-        // 4) input в родительском контейнере
-        const parent = el.closest('.form-group, .form-row, .field, .row, div');
-        if (parent) {
-            const fromParent = parent.querySelector('input:not([type="hidden"])');
-            if (fromParent && fromParent !== el) return fromParent;
-        }
-        return null;
-    };
-
-    const candidates = Array.from(document.querySelectorAll(
-        'label, .control-label, .form-label, legend, th, td, span'
-    ));
-    for (const c of candidates) {
-        const text = norm(c.textContent);
-        if (!text) continue;
-        if (text === target || text.startsWith(target) || text.includes(target)) {
-            const input = findInputNear(c);
-            if (input) {
-                input.focus();
-                input.value = value;
-                input.dispatchEvent(new Event('input', {bubbles: true}));
-                input.dispatchEvent(new Event('change', {bubbles: true}));
-                input.blur();
-                return true;
-            }
-        }
-    }
-    return false;
-}"""
-
-
-def _select_options_by_text(page: Page, selector: str,
-                            texts: list[str], exact: bool = False) -> bool:
-    return bool(page.evaluate(
-        _SELECT_BY_TEXT_JS,
-        {"selector": selector, "targets": texts, "exact": exact},
-    ))
-
-
-def _fill_input_by_label(page: Page, label_text: str, value: str,
-                         fallback_names: list[str] | None = None) -> bool:
-    ok = bool(page.evaluate(_FILL_INPUT_BY_LABEL_JS,
-                            {"labelText": label_text, "value": value}))
-    if ok:
-        return True
-
-    if fallback_names:
-        for name in fallback_names:
-            loc = page.locator(f"input[name='{name}']")
-            if loc.count():
-                try:
-                    loc.first.fill(value)
-                    return True
-                except Exception:
-                    continue
-
-    logger.warning("Не удалось найти поле по label '%s'", label_text)
-    return False
-
-
-def _find_select_for_label(page: Page, label_text: str) -> str | None:
-    """Возвращает CSS-селектор для select-а, соответствующего метке."""
-    name = page.evaluate(
-        """(labelText) => {
-            const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-            const target = norm(labelText);
-            const labels = Array.from(document.querySelectorAll(
-                'label, .control-label, .form-label, legend, span'
-            ));
-            for (const lbl of labels) {
-                if (norm(lbl.textContent).includes(target)) {
-                    let sel = null;
-                    if (lbl.htmlFor) {
-                        const el = document.getElementById(lbl.htmlFor);
-                        if (el && el.tagName === 'SELECT') sel = el;
-                    }
-                    if (!sel) sel = lbl.querySelector('select');
-                    if (!sel) {
-                        let sib = lbl.nextElementSibling;
-                        while (sib && !sel) {
-                            sel = sib.tagName === 'SELECT' ? sib : sib.querySelector('select');
-                            sib = sib.nextElementSibling;
-                        }
-                    }
-                    if (!sel) {
-                        const parent = lbl.closest('.form-group, .field, .row, div');
-                        if (parent) sel = parent.querySelector('select');
-                    }
-                    if (sel && sel.name) return sel.name;
-                }
-            }
-            return null;
-        }""",
-        label_text,
+            secret = st.secrets.get("goszakup_token")  # type: ignore[attr-defined]
+            if secret:
+                secret = str(secret).strip()
+                if secret:
+                    return secret
+        except Exception:  # noqa: BLE001
+            pass
+    raise RuntimeError(
+        "Токен Goszakup API не найден. Установите переменную окружения "
+        "GOSZAKUP_TOKEN или ключ st.secrets['goszakup_token']."
     )
-    return f"select[name='{name}']" if name else None
-
-
-def apply_announcements_filters(page: Page, selected_date: str) -> None:
-    """
-    Применяет фильтры на странице поиска объявлений.
-    selected_date — строка вида "YYYY-MM-DD".
-    """
-    logger.info("Применяем фильтры для поиска объявлений. Дата: %s", selected_date)
-
-    # Дожидаемся, пока форма поиска проявится
-    page.wait_for_selector("form, .filter-form, input[type='submit'], button[type='submit']",
-                           state="visible",
-                           timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(400)
-
-    # ── 1) Статус ──────────────────────────────────────────────────────────
-    status_selectors = [
-        "select[name='filter[status][]']",
-        "select[name='filter[status]']",
-    ]
-    label_sel = _find_select_for_label(page, "Статус")
-    if label_sel:
-        status_selectors.insert(0, label_sel)
-
-    status_set = False
-    for sel in status_selectors:
-        if page.locator(sel).count():
-            status_set = _select_options_by_text(page, sel, TARGET_STATUS_TEXTS)
-            if status_set:
-                logger.info("Статус выставлен через %s", sel)
-                break
-    if not status_set:
-        logger.warning("Не удалось выставить фильтр Статус")
-
-    page.wait_for_timeout(200)
-
-    # ── 2) Предмет закупки ─────────────────────────────────────────────────
-    subject_selectors = [
-        "select[name='filter[subject][]']",
-        "select[name='filter[subject]']",
-        "select[name='filter[item_type][]']",
-        "select[name='filter[item_type]']",
-    ]
-    label_sel = _find_select_for_label(page, "Предмет закупки")
-    if label_sel:
-        subject_selectors.insert(0, label_sel)
-
-    subject_set = False
-    for sel in subject_selectors:
-        if page.locator(sel).count():
-            subject_set = _select_options_by_text(page, sel, [TARGET_SUBJECT_TEXT], exact=True)
-            if subject_set:
-                logger.info("Предмет закупки выставлен через %s", sel)
-                break
-    if not subject_set:
-        logger.warning("Не удалось выставить фильтр Предмет закупки")
-
-    page.wait_for_timeout(200)
-
-    # ── 3) Сумма закупки с ─────────────────────────────────────────────────
-    _fill_input_by_label(
-        page, "Сумма закупки с", MIN_PURCHASE_SUM,
-        fallback_names=[
-            "filter[sum_min]",
-            "filter[amount_from]",
-            "filter[amount_min]",
-            "filter[count_min]",
-            "filter[total_sum_from]",
-        ],
-    )
-    page.wait_for_timeout(150)
-
-    # ── 4) Окончание приема заявок с ───────────────────────────────────────
-    _fill_input_by_label(
-        page, "Окончание приема заявок с", selected_date,
-        fallback_names=[
-            "filter[date_acceptance_of_applications_end]",
-            "filter[end_date_acceptance_from]",
-            "filter[end_date_from]",
-            "filter[date_end_from]",
-        ],
-    )
-    page.wait_for_timeout(150)
-
-    # ── 5) Поиск ───────────────────────────────────────────────────────────
-    # Берём submit-кнопку именно из формы фильтров (первую видимую)
-    search_btn = page.locator(
-        "button[type='submit'], input[type='submit']"
-    ).first
-    search_btn.wait_for(state="visible", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    search_btn.click()
-    page.wait_for_load_state("domcontentloaded", timeout=PLAYWRIGHT_CONFIG["timeout"])
-    page.wait_for_timeout(800)
-
-    logger.info("Фильтры применены. URL: %s", page.url)
 
 
 # ---------------------------------------------------------------------------
-# Сбор объявлений из таблицы (включая пагинацию)
+# GraphQL-запросы
 # ---------------------------------------------------------------------------
 
-_COLLECT_ROWS_JS = """() => {
-    // Ищем таблицу результатов: содержит ссылку на объявление в колонке "Наименование".
-    const link = document.querySelector(
-        "a[href*='/announce/index/'], a[href*='/announcement/'], a[href*='/announce/show/']"
-    );
-    if (!link) return [];
-    const table = link.closest('table');
-    if (!table) return [];
+_TRD_BUY_QUERY = """
+query($filter: TrdBuyFiltersInput, $after: Int) {
+  trd_buy(limit: 50, after: $after, filters: $filter) {
+    id
+    name_ru
+    number_anno
+    ref_buy_status_id
+    start_date
+    end_date
+    price
+    ref_type_trade_id
+  }
+}
+"""
 
-    // Карта заголовков → индекс
-    const headerCells = Array.from(
-        (table.tHead && table.tHead.rows[0])
-        ? table.tHead.rows[0].cells
-        : (table.rows[0] ? table.rows[0].cells : [])
-    );
-    const norm = s => (s || '').replace(/\\s+/g, ' ').trim().toLowerCase();
-    const headers = headerCells.map(c => norm(c.innerText));
-
-    const indexOfHeader = (substr) => headers.findIndex(h => h.includes(substr));
-
-    const idxNumber = indexOfHeader('№');
-    const idxName   = (() => {
-        let i = indexOfHeader('наименование');
-        if (i === -1) i = indexOfHeader('название');
-        return i;
-    })();
-    const idxMethod = indexOfHeader('способ');
-    const idxStart  = indexOfHeader('начало');
-    const idxEnd    = indexOfHeader('окончание');
-    const idxSum    = (() => {
-        let i = indexOfHeader('сумма');
-        if (i === -1) i = indexOfHeader('стоимость');
-        return i;
-    })();
-    const idxStatus = indexOfHeader('статус');
-
-    const out = [];
-    const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : table.rows;
-    for (const row of bodyRows) {
-        // Пропускаем строки заголовка
-        if (row.cells.length === 0) continue;
-        if (row.cells[0] && row.cells[0].tagName === 'TH') continue;
-
-        const anchor = row.querySelector(
-            "a[href*='/announce/index/'], a[href*='/announcement/'], a[href*='/announce/show/']"
-        );
-        if (!anchor) continue;
-
-        const href = anchor.getAttribute('href') || '';
-        const cells = row.cells;
-        const get = (idx) => (idx >= 0 && idx < cells.length ? cells[idx].innerText.trim() : '');
-
-        const name = (anchor.innerText || '').trim() || get(idxName);
-
-        out.push({
-            number:     get(idxNumber),
-            name:       name,
-            method:     get(idxMethod),
-            start_date: get(idxStart),
-            end_date:   get(idxEnd),
-            sum_amount: get(idxSum),
-            status:     get(idxStatus),
-            url:        href,
-        });
+_LOTS_BY_TRD_BUY_QUERY = """
+query($id: Int) {
+  trd_buy(filters: { id: [$id] }) {
+    id
+    lots {
+      id
+      winner_id
+      winner_bin
+      winner_name_ru
     }
-    return out;
-}"""
+  }
+}
+"""
+
+_CONTRACT_EXISTS_QUERY = """
+query($anno: String) {
+  contract(limit: 1, filters: { trd_buy_number_anno: $anno }) {
+    id
+  }
+}
+"""
+
+_CONTRACT_BY_FILTER_QUERY = """
+query($filter: ContractFiltersInput) {
+  contract(limit: 1, filters: $filter) {
+    id
+    contract_sum_wnds
+    supplier_biin
+  }
+}
+"""
+
+_LOTS_QUERY = """
+query($filter: LotsFiltersInput) {
+  lots(limit: 1, filters: $filter) {
+    id
+    budget
+    winner_price
+  }
+}
+"""
 
 
-def collect_announcement_links(page: Page) -> list[dict]:
-    """
-    Собирает информацию обо всех объявлениях (по всем страницам пагинации).
-    """
-    announcements: list[dict] = []
-    seen_urls: set[str] = set()
-    page_num = 1
+def _graphql_request(endpoint: str, token: str, query: str, variables: dict) -> dict:
+    payload = {"query": query, "variables": variables}
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    last_exc: Exception | None = None
+    for attempt in range(RETRY_COUNT + 1):
+        try:
+            resp = requests.post(
+                endpoint, json=payload, headers=headers,
+                timeout=REQUEST_TIMEOUT, verify=False,
+            )
+            resp.raise_for_status()
+            return resp.json()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            logger.warning("GraphQL %s запрос попытка %d/%d: %s",
+                           endpoint, attempt + 1, RETRY_COUNT + 1, exc)
+            if attempt < RETRY_COUNT:
+                time.sleep(RETRY_DELAY)
+    raise RuntimeError(f"GraphQL запрос {endpoint} завершился ошибкой: {last_exc}")
+
+
+# ---------------------------------------------------------------------------
+# Утилиты
+# ---------------------------------------------------------------------------
+
+def _to_float(value) -> float:
+    if value is None:
+        return 0.0
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _to_int(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _method_label(ref_id) -> str:
+    rid = _to_int(ref_id)
+    if rid is None:
+        return ""
+    return METHOD_MAP.get(rid, str(rid))
+
+
+def _status_label(ref_id) -> str:
+    rid = _to_int(ref_id)
+    if rid is None:
+        return ""
+    return STATUS_MAP.get(rid, str(rid))
+
+
+def _passthrough_date(s: str | None) -> str:
+    return (s or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Шаг 1 — список объявлений (с пагинацией)
+# ---------------------------------------------------------------------------
+
+def _fetch_announcements(
+    token: str,
+    selected_date: str,
+    errors_sink: list[str],
+) -> list[dict]:
+    items: list[dict] = []
+    after: int | None = None
+    filter_input = {
+        "ref_buy_status_id": TARGET_STATUS_IDS,
+        "ref_subject_type_id": TARGET_SUBJECT_IDS,
+        "end_date_gte": selected_date,
+        "price_gte": MIN_SUM_AMOUNT,
+    }
 
     while True:
-        logger.info("Сбор объявлений — страница %d", page_num)
+        variables: dict = {"filter": filter_input}
+        if after is not None:
+            variables["after"] = after
 
         try:
-            page.wait_for_selector("table", state="attached",
-                                   timeout=PLAYWRIGHT_CONFIG["timeout"])
-        except Exception:
-            logger.warning("Таблица результатов не появилась на странице %d", page_num)
-            break
-
-        rows = page.evaluate(_COLLECT_ROWS_JS)
-        new_count = 0
-        for row in rows:
-            url = row.get("url", "")
-            if not url:
-                continue
-            absolute = url if url.startswith("http") else BASE_URL + url
-            if absolute in seen_urls:
-                continue
-            seen_urls.add(absolute)
-            row["url"] = absolute
-            announcements.append(row)
-            new_count += 1
-
-        logger.info("Страница %d: %d новых объявлений (всего: %d)",
-                    page_num, new_count, len(announcements))
-
-        if new_count == 0:
-            break
-
-        # Пагинация: ищем ссылку «»»
-        next_li = page.locator(".pagination li").filter(has_text="»").first
-        if not next_li.count():
-            break
-        try:
-            is_disabled = next_li.evaluate(
-                "el => el.classList.contains('disabled') || el.classList.contains('active')"
+            response = _graphql_request(
+                GRAPHQL_V3_ENDPOINT, token, _TRD_BUY_QUERY, variables
             )
-        except Exception:
-            is_disabled = False
-        if is_disabled:
+        except Exception as exc:  # noqa: BLE001
+            errors_sink.append(f"trd_buy: {exc}")
             break
 
-        try:
-            next_li.locator("a").first.click()
-            page.wait_for_load_state("domcontentloaded",
-                                     timeout=PLAYWRIGHT_CONFIG["timeout"])
-            page.wait_for_timeout(500)
-        except Exception as exc:
-            logger.warning("Не удалось перейти на следующую страницу: %s", exc)
+        gql_errors = response.get("errors")
+        if gql_errors:
+            msg = "; ".join(str(e.get("message", e)) for e in gql_errors)
+            errors_sink.append(f"GraphQL error: {msg}")
             break
 
-        page_num += 1
-        if page_num > 100:
-            logger.warning("Достигнут лимит страниц пагинации (100)")
+        batch = (response.get("data") or {}).get("trd_buy") or []
+        items.extend(batch)
+
+        page_info = (response.get("extensions") or {}).get("pageInfo") or {}
+        has_next = bool(page_info.get("hasNextPage"))
+        last_id = page_info.get("lastId")
+
+        if not batch or not has_next or last_id is None or len(items) >= MAX_RECORDS:
             break
+        after = last_id
 
-        _random_delay(0.3)
-
-    logger.info("Всего объявлений: %d", len(announcements))
-    return announcements
+    return items
 
 
 # ---------------------------------------------------------------------------
-# Парсинг одного объявления
+# Шаг 2 — победитель
 # ---------------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Универсальный парсер вкладок: одним обходом DOM извлекаем
-#   • hasContracts  — есть ли реальные записи во вкладке «Договоры»
-#   • winnerText    — текст ячейки «Победитель» (fallback на случай отсутствия ссылки)
-#   • winnerHref    — href ссылки в ячейке «Победитель» (страница участника)
-#   • protocolHref  — href кнопки «Просмотреть протокол» (HTML-файл протокола)
-# Все вкладки goszakup рендерятся в DOM сразу (Bootstrap), клики не нужны.
-# ---------------------------------------------------------------------------
-
-_PARSE_TABS_JS = r"""() => {
-    const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-
-    const panes = Array.from(document.querySelectorAll(
-        '.tab-pane, [role="tabpanel"], .tab-content > div'
-    ));
-    const labelFor = (pane) => {
-        const id = pane.id;
-        if (!id) return '';
-        const anchors = document.querySelectorAll(
-            `a[href="#${id}"], a[data-bs-target="#${id}"], a[aria-controls="${id}"], button[data-bs-target="#${id}"]`
-        );
-        for (const a of anchors) {
-            const t = norm(a.textContent);
-            if (t) return t;
-        }
-        return '';
-    };
-
-    const isContractsPane = (pane, label) => {
-        if (label.includes('договор')) return true;
-        const txt = norm(pane.innerText);
-        return txt.includes('номер договора') && !txt.includes('победител');
-    };
-    const isWinnersPane = (pane, label) =>
-        label.includes('победител') || label.includes('информация о победителях');
-    const isProtocolsPane = (pane, label) =>
-        label.includes('протокол');
-
-    const hasRealRows = (pane) => {
-        const tables = pane.querySelectorAll('table');
-        for (const t of tables) {
-            const bodyRows = t.tBodies[0] ? t.tBodies[0].rows : t.querySelectorAll('tr');
-            for (const r of bodyRows) {
-                if (r.querySelector('th') && r.cells.length === r.querySelectorAll('th').length) continue;
-                const txt = norm(r.innerText);
-                if (!txt) continue;
-                if (txt.includes('нет данных') || txt.includes('отсутству') ||
-                    txt.includes('не найдено')) continue;
-                if (r.cells.length > 0) return true;
-            }
-        }
-        return false;
-    };
-
-    const winnerFromPane = (pane) => {
-        const tables = pane.querySelectorAll('table');
-        for (const table of tables) {
-            let headerCells = [];
-            if (table.tHead && table.tHead.rows[0]) headerCells = Array.from(table.tHead.rows[0].cells);
-            else if (table.rows[0]) headerCells = Array.from(table.rows[0].cells);
-            const headers = headerCells.map(c => norm(c.innerText));
-            const winnerIdx = headers.findIndex(h => h.includes('победител'));
-            if (winnerIdx === -1) continue;
-            const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : Array.from(table.rows).slice(1);
-            for (const r of bodyRows) {
-                if (r.cells.length <= winnerIdx) continue;
-                const cell = r.cells[winnerIdx];
-                const text = (cell.innerText || '').trim();
-                if (!text) continue;
-                const anchor = cell.querySelector("a[href]");
-                let href = anchor ? (anchor.getAttribute('href') || '') : '';
-                if (href && href.startsWith('javascript:')) href = '';
-                return { text: text, href: href };
-            }
-        }
-        return null;
-    };
-
-    const protocolHrefFromPane = (pane) => {
-        const anchors = pane.querySelectorAll('a');
-        for (const a of anchors) {
-            const t = norm(a.textContent);
-            const href = a.getAttribute('href') || '';
-            if (!href || href.startsWith('javascript:')) continue;
-            if (t.includes('просмотреть') ||
-                t.includes('протокол итогов') ||
-                href.includes('protokol') ||
-                href.includes('p_itog')) {
-                return href;
-            }
-        }
-        return null;
-    };
-
-    const out = {
-        hasContracts: false,
-        winnerText:   null,
-        winnerHref:   null,
-        protocolHref: null,
-    };
-
-    const targets = panes.length ? panes : [document.body];
-
-    for (const pane of targets) {
-        const label = panes.length ? labelFor(pane) : '';
-        if (panes.length && isContractsPane(pane, label)) {
-            if (hasRealRows(pane)) out.hasContracts = true;
-        }
-        if (panes.length && isWinnersPane(pane, label) && !out.winnerText) {
-            const w = winnerFromPane(pane);
-            if (w) { out.winnerText = w.text; out.winnerHref = w.href || null; }
-        }
-        if (panes.length && isProtocolsPane(pane, label) && !out.protocolHref) {
-            const u = protocolHrefFromPane(pane);
-            if (u) out.protocolHref = u;
-        }
-    }
-
-    // Фолбэк: если по label-меткам ничего не нашли — обходим всю страницу
-    if (!out.winnerText) {
-        const w = winnerFromPane(document.body);
-        if (w) { out.winnerText = w.text; out.winnerHref = w.href || null; }
-    }
-    if (!out.protocolHref) {
-        const u = protocolHrefFromPane(document.body);
-        if (u) out.protocolHref = u;
-    }
-
-    return out;
-}"""
-
-
-# ---------------------------------------------------------------------------
-# Извлечение значений по подписи: ищем <td>label</td><td>value</td> или <dt><dd>
-# ---------------------------------------------------------------------------
-
-_EXTRACT_LABELS_JS = r"""(labels) => {
-    const norm = s => (s || '').replace(/\s+/g, ' ').trim();
-    const lcase = s => norm(s).toLowerCase();
-    const targets = new Map();
-    for (const lbl of labels) targets.set(lcase(lbl), lbl);
-
-    const result = {};
-
-    const tryAssign = (label, value) => {
-        const v = norm(value);
-        if (!v) return;
-        if (!result[label]) result[label] = v;
-    };
-
-    // td/th -> next td
-    for (const el of document.querySelectorAll('td, th')) {
-        const text = lcase(el.innerText);
-        if (!text) continue;
-        if (targets.has(text)) {
-            const next = el.nextElementSibling;
-            if (next) tryAssign(targets.get(text), next.innerText);
-            continue;
-        }
-        // Иногда метка может оканчиваться двоеточием
-        const noColon = text.replace(/[:：]$/, '').trim();
-        if (noColon !== text && targets.has(noColon)) {
-            const next = el.nextElementSibling;
-            if (next) tryAssign(targets.get(noColon), next.innerText);
-        }
-    }
-
-    // <dt><dd>
-    for (const dt of document.querySelectorAll('dt')) {
-        const text = lcase(dt.innerText);
-        if (!text || !targets.has(text)) continue;
-        const dd = dt.nextElementSibling;
-        if (dd && dd.tagName === 'DD') tryAssign(targets.get(text), dd.innerText);
-    }
-
-    return result;
-}"""
-
-
-_PARSE_PROTOCOL_PRICE_JS = r"""(winnerBin) => {
-    const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
-    const tables = document.querySelectorAll('table');
-    for (const table of tables) {
-        const tableTxt = norm(table.innerText);
-        if (!tableTxt.includes('цена') && !tableTxt.includes('расчет условных цен')) continue;
-
-        let headerCells = [];
-        if (table.tHead && table.tHead.rows[0]) {
-            headerCells = Array.from(table.tHead.rows[0].cells);
-        } else if (table.rows[0]) {
-            headerCells = Array.from(table.rows[0].cells);
-        }
-        const headers = headerCells.map(c => norm(c.innerText));
-
-        const binCol = headers.findIndex(h =>
-            h.includes('бин') || h.includes('инн') || h.includes('унп'));
-        let priceCol = headers.findIndex(h =>
-            h.includes('цена') && (h.includes('поставщик') || h.includes('участник')));
-        if (priceCol === -1) priceCol = headers.findIndex(h => h.includes('цена поставщика'));
-        if (priceCol === -1) priceCol = headers.findIndex(h => h === 'цена');
-        if (binCol === -1 || priceCol === -1) continue;
-
-        const bodyRows = table.tBodies[0] ? table.tBodies[0].rows : Array.from(table.rows).slice(1);
-        for (const r of bodyRows) {
-            if (r.cells.length <= Math.max(binCol, priceCol)) continue;
-            const binText = (r.cells[binCol].innerText || '').trim();
-            if (binText.includes(winnerBin)) {
-                return (r.cells[priceCol].innerText || '').trim();
-            }
-        }
-    }
-    return null;
-}"""
-
-
-def _fetch_winner_details(
-    context: BrowserContext,
-    winner_url: str,
-) -> tuple[str, str]:
-    """
-    Открывает страницу участника-победителя и достаёт:
-      • «Наименование на рус. языке»
-      • «БИН участника» (или похожие подписи: «БИН (ИНН)/ИНН/УНП», «БИН»)
-    """
-    if not winner_url:
-        return "", ""
-    absolute = winner_url if winner_url.startswith("http") else BASE_URL + winner_url
-
-    winner_page: Page | None = None
+def _fetch_winner(token: str, ann_id: int) -> tuple[str, str]:
+    """Возвращает (winner_bin, winner_name_ru) или ('', '')."""
     try:
-        winner_page = context.new_page()
-        _setup_page_routes(winner_page)
-        for attempt in range(1, RETRY_COUNT + 2):
-            try:
-                winner_page.goto(absolute, wait_until="domcontentloaded",
-                                 timeout=PLAYWRIGHT_CONFIG["timeout"])
-                break
-            except Exception as exc:
-                if attempt > RETRY_COUNT:
-                    logger.debug("Не удалось открыть страницу победителя %s: %s",
-                                 absolute, exc)
-                    return "", ""
-                time.sleep(1)
-
-        labels = [
-            "Наименование на рус. языке",
-            "Наименование на русском языке",
-            "БИН участника",
-            "БИН (ИНН)/ИНН/УНП",
-            "БИН/ИНН/УНП",
-            "БИН",
-        ]
-        try:
-            data = winner_page.evaluate(_EXTRACT_LABELS_JS, labels) or {}
-        except Exception as exc:
-            logger.debug("_EXTRACT_LABELS_JS error: %s", exc)
-            data = {}
-
-        name = (data.get("Наименование на рус. языке")
-                or data.get("Наименование на русском языке")
-                or "").strip()
-        bin_raw = (data.get("БИН участника")
-                   or data.get("БИН (ИНН)/ИНН/УНП")
-                   or data.get("БИН/ИНН/УНП")
-                   or data.get("БИН")
-                   or "")
-        bin_value = _extract_bin(bin_raw)
-
-        return name, bin_value
-
-    except Exception as exc:
-        logger.debug("_fetch_winner_details error: %s", exc)
+        resp = _graphql_request(
+            GRAPHQL_V3_ENDPOINT, token, _LOTS_BY_TRD_BUY_QUERY,
+            {"id": int(ann_id)},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_fetch_winner(id=%s) ошибка: %s", ann_id, exc)
         return "", ""
-    finally:
-        if winner_page is not None:
-            try:
-                winner_page.close()
-            except Exception:
-                pass
+
+    trd = (resp.get("data") or {}).get("trd_buy") or []
+    if not trd:
+        return "", ""
+    lots = trd[0].get("lots") or []
+    for lot in lots:
+        bin_value = (lot.get("winner_bin") or "").strip()
+        name_value = (lot.get("winner_name_ru") or "").strip()
+        if bin_value:
+            return bin_value, name_value
+    return "", ""
 
 
-def _fetch_protocol_price(
-    context: BrowserContext,
-    protocol_url: str,
+# ---------------------------------------------------------------------------
+# Шаг 3 — проверка наличия договоров
+# ---------------------------------------------------------------------------
+
+def _check_has_contracts(token: str, number_anno: str) -> bool:
+    if not number_anno:
+        return False
+    try:
+        resp = _graphql_request(
+            GRAPHQL_V2_ENDPOINT, token, _CONTRACT_EXISTS_QUERY,
+            {"anno": number_anno},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("_check_has_contracts(%s) ошибка: %s", number_anno, exc)
+        return False
+    contracts = (resp.get("data") or {}).get("contract") or []
+    return bool(contracts)
+
+
+# ---------------------------------------------------------------------------
+# Шаг 4 — цена победителя
+# ---------------------------------------------------------------------------
+
+def _fetch_winner_price(
+    token: str,
+    number_anno: str,
     winner_bin: str,
+    ann_id: int | None,
 ) -> float:
-    """
-    Извлекает «Цену поставщика» из протокола итогов.
-
-    Клик по «Просмотреть протокол» возвращает HTML с заголовком
-    Content-Disposition: attachment, поэтому браузер сохраняет файл, а не
-    отображает страницу. Используем Playwright's expect_download(), а потом
-    открываем сохранённый файл через file:// и применяем _PARSE_PROTOCOL_PRICE_JS.
-
-    Если по какой-то причине ответ оказался обычной HTML-страницей
-    (без attachment), парсер делает фолбэк на прямой goto.
-    """
-    if not protocol_url or not winner_bin:
-        return 0.0
-    absolute = protocol_url if protocol_url.startswith("http") else BASE_URL + protocol_url
-
-    saved_path: str | None = None
-
-    # ── Попытка 1: захватить скачивание ────────────────────────────────────
-    dl_page: Page | None = None
-    try:
-        dl_page = context.new_page()
+    # 4а) Договор по объявлению + БИН поставщика
+    if number_anno and winner_bin:
         try:
-            with dl_page.expect_download(timeout=20_000) as dl_info:
-                try:
-                    dl_page.goto(absolute, timeout=PLAYWRIGHT_CONFIG["timeout"])
-                except Exception:
-                    # Навигация прерывается, когда сервер возвращает
-                    # Content-Disposition: attachment — это нормально.
-                    pass
-            download = dl_info.value
-            try:
-                saved_path = download.path()
-            except Exception as exc:
-                logger.debug("download.path() failed: %s", exc)
-                saved_path = None
-        except Exception:
-            saved_path = None
-    finally:
-        if dl_page is not None:
-            try:
-                dl_page.close()
-            except Exception:
-                pass
-
-    # ── Парсинг скачанного HTML файла ──────────────────────────────────────
-    if saved_path:
-        try:
-            file_uri = Path(saved_path).resolve().as_uri()
-        except Exception:
-            file_uri = None
-
-        parser_page: Page | None = None
-        try:
-            parser_page = context.new_page()
-            if file_uri:
-                parser_page.goto(file_uri, wait_until="domcontentloaded",
-                                 timeout=PLAYWRIGHT_CONFIG["timeout"])
-            else:
-                with open(saved_path, encoding="utf-8", errors="replace") as f:
-                    parser_page.set_content(f.read(), wait_until="domcontentloaded")
-            raw_price = parser_page.evaluate(_PARSE_PROTOCOL_PRICE_JS, winner_bin)
-            if raw_price:
-                return _parse_amount(raw_price)
-        except Exception as exc:
-            logger.debug("Ошибка парсинга скачанного протокола %s: %s",
-                         saved_path, exc)
-        finally:
-            if parser_page is not None:
-                try:
-                    parser_page.close()
-                except Exception:
-                    pass
-
-    # ── Фолбэк: вдруг это всё-таки обычная страница ────────────────────────
-    fb_page: Page | None = None
-    try:
-        fb_page = context.new_page()
-        _setup_page_routes(fb_page)
-        fb_page.goto(absolute, wait_until="domcontentloaded",
-                     timeout=PLAYWRIGHT_CONFIG["timeout"])
-        raw_price = fb_page.evaluate(_PARSE_PROTOCOL_PRICE_JS, winner_bin)
-        return _parse_amount(raw_price) if raw_price else 0.0
-    except Exception as exc:
-        logger.debug("Fallback _fetch_protocol_price error: %s", exc)
-        return 0.0
-    finally:
-        if fb_page is not None:
-            try:
-                fb_page.close()
-            except Exception:
-                pass
-
-
-def parse_announcement(page: Page, ann_data: dict, index: int) -> AnnouncementRecord:
-    """
-    Парсит одно объявление:
-      1. Открывает страницу объявления.
-      2. Одним JS-обходом DOM извлекает:
-           • has_contracts          — есть ли записи во вкладке «Договоры»;
-           • ссылку на победителя   — href из ячейки «Победитель»;
-           • ссылку на протокол     — href «Просмотреть протокол».
-      3. Переходит по ссылке победителя и парсит:
-           • «Наименование на рус. языке»
-           • «БИН участника»
-      4. Если has_contracts=True   → цена остаётся пустой (по ТЗ),
-         иначе                     → скачивает HTML протокола итогов через
-                                      expect_download() и достаёт цену поставщика
-                                      по БИН победителя из таблицы
-                                      «Расчет условных цен участников конкурса».
-    """
-    url = ann_data["url"]
-    number_str = (ann_data.get("number") or "").strip()
-    number = int(number_str) if number_str.isdigit() else index
-
-    record = AnnouncementRecord(
-        number=number,
-        name=ann_data.get("name", ""),
-        method=ann_data.get("method", ""),
-        start_date=ann_data.get("start_date", ""),
-        end_date=ann_data.get("end_date", ""),
-        sum_amount=_parse_amount(ann_data.get("sum_amount", "")),
-        status=ann_data.get("status", ""),
-        winner_name="",
-        winner_bin="",
-        winner_price=0.0,
-        url=url,
-        has_contracts=False,
-        error="",
-    )
-
-    for attempt in range(1, RETRY_COUNT + 2):
-        try:
-            page.goto(url, wait_until="domcontentloaded",
-                      timeout=PLAYWRIGHT_CONFIG["timeout"])
-            break
-        except Exception as exc:
-            if attempt > RETRY_COUNT:
-                record.error = f"Ошибка загрузки: {exc}"
-                return record
-            time.sleep(1)
-
-    try:
-        tabs_data = page.evaluate(_PARSE_TABS_JS) or {}
-    except Exception as exc:
-        logger.debug("_PARSE_TABS_JS error %s: %s", url, exc)
-        tabs_data = {}
-
-    has_contracts = bool(tabs_data.get("hasContracts"))
-    winner_text   = tabs_data.get("winnerText") or ""
-    winner_href   = tabs_data.get("winnerHref") or ""
-    protocol_href = tabs_data.get("protocolHref") or ""
-
-    record.has_contracts = has_contracts
-
-    # ── Победитель: открываем страницу участника по ссылке из ячейки «Победитель»
-    if winner_href:
-        try:
-            w_name, w_bin = _fetch_winner_details(page.context, winner_href)
-        except Exception as exc:
-            logger.debug("Ошибка _fetch_winner_details: %s", exc)
-            w_name, w_bin = "", ""
-        record.winner_name = w_name
-        record.winner_bin = w_bin
-
-    # Фолбэк: парсим прямо из текста ячейки, если страница победителя не открылась
-    if not record.winner_bin and winner_text:
-        bin_fb = _extract_bin(winner_text)
-        if bin_fb:
-            record.winner_bin = bin_fb
-        if not record.winner_name:
-            record.winner_name = _clean_company_name(winner_text, bin_fb)
-
-    # ── Цена: скачиваем HTML протокола итогов через expect_download
-    if not has_contracts and record.winner_bin and protocol_href:
-        try:
-            record.winner_price = _fetch_protocol_price(
-                page.context, protocol_href, record.winner_bin
+            resp = _graphql_request(
+                GRAPHQL_V2_ENDPOINT, token, _CONTRACT_BY_FILTER_QUERY,
+                {"filter": {
+                    "trd_buy_number_anno": number_anno,
+                    "supplier_biin": winner_bin,
+                }},
             )
-        except Exception as exc:
-            logger.debug("Ошибка _fetch_protocol_price: %s", exc)
-            record.winner_price = 0.0
+            contracts = (resp.get("data") or {}).get("contract") or []
+            if contracts:
+                amount = _to_float(contracts[0].get("contract_sum_wnds"))
+                if amount > 0:
+                    return amount
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_fetch_winner_price contract ошибка: %s", exc)
 
-    if not record.winner_bin and not record.winner_name:
-        record.error = "Победитель не найден"
+    # 4б) Фолбэк — данные лота
+    if ann_id is not None:
+        try:
+            resp = _graphql_request(
+                GRAPHQL_V3_ENDPOINT, token, _LOTS_QUERY,
+                {"filter": {"trd_buy_id": [int(ann_id)]}},
+            )
+            lots = (resp.get("data") or {}).get("lots") or []
+            if lots:
+                lot = lots[0]
+                for key in ("winner_price", "budget"):
+                    value = _to_float(lot.get(key))
+                    if value > 0:
+                        return value
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("_fetch_winner_price lots ошибка: %s", exc)
 
-    return record
+    return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -1048,148 +395,98 @@ def scrape_announcements(
     on_progress: ProgressCallback | None = None,
     on_record: RecordCallback | None = None,
 ) -> ScrapeAnnouncementsResult:
-    """
-    Главная функция парсинга объявлений.
-    selected_date — строка вида "YYYY-MM-DD".
-    """
+    """Главная функция парсинга объявлений. selected_date — строка "YYYY-MM-DD"."""
     result = ScrapeAnnouncementsResult(selected_date=selected_date)
 
-    nav_page = None
-    announcement_page = None
-
     try:
-        with sync_playwright() as pw:
-            browser: Browser = pw.chromium.launch(
-                headless=PLAYWRIGHT_CONFIG["headless"],
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--no-zygote",
-                    "--disable-extensions",
-                    "--disable-background-networking",
-                    "--disable-background-timer-throttling",
-                    "--disable-client-side-phishing-detection",
-                    "--disable-default-apps",
-                    "--disable-hang-monitor",
-                    "--disable-sync",
-                    "--metrics-recording-only",
-                    "--mute-audio",
-                    "--no-first-run",
-                    "--safebrowsing-disable-auto-update",
-                ],
-            )
-            context: BrowserContext = browser.new_context(
-                viewport=PLAYWRIGHT_CONFIG["viewport"],
-                locale=PLAYWRIGHT_CONFIG["locale"],
-                user_agent=PLAYWRIGHT_CONFIG["user_agent"],
-                extra_http_headers={
-                    "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-                    "Accept": (
-                        "text/html,application/xhtml+xml,application/xml;"
-                        "q=0.9,image/webp,*/*;q=0.8"
-                    ),
-                },
-            )
-            context.set_default_timeout(PLAYWRIGHT_CONFIG["timeout"])
-
+        token = _get_token()
+    except Exception as exc:  # noqa: BLE001
+        result.errors.append(str(exc))
+        if on_progress:
             try:
-                # Поиск и сбор ссылок
-                nav_page = context.new_page()
-                _setup_page_routes(nav_page)
+                on_progress(0, 0, f"Ошибка: {exc}")
+            except Exception:  # noqa: BLE001
+                pass
+        return result
 
-                if on_progress:
-                    on_progress(0, 0, "Открываем поиск объявлений...")
+    if on_progress:
+        try:
+            on_progress(0, 0, "Запрос списка объявлений...")
+        except Exception:  # noqa: BLE001
+            pass
 
-                navigate_to_announcements(nav_page)
+    items = _fetch_announcements(token, selected_date, result.errors)
 
-                if on_progress:
-                    on_progress(0, 0, "Применяем фильтры...")
+    if not items:
+        logger.warning("Объявления не найдены для даты: %s", selected_date)
+        if on_progress:
+            try:
+                on_progress(0, 0, "Объявления не найдены")
+            except Exception:  # noqa: BLE001
+                pass
+        return result
 
-                apply_announcements_filters(nav_page, selected_date)
+    total = len(items)
+    for idx, item in enumerate(items, start=1):
+        if on_progress:
+            try:
+                on_progress(idx, total, f"Объявление {idx} из {total}")
+            except Exception:  # noqa: BLE001
+                pass
 
-                if on_progress:
-                    on_progress(0, 0, "Собираем список объявлений...")
+        ann_id = _to_int(item.get("id"))
+        number_anno = (item.get("number_anno") or "").strip()
+        url = ANNOUNCEMENT_URL_TEMPLATE.format(id=ann_id) if ann_id is not None else ""
 
-                ann_list = collect_announcement_links(nav_page)
+        record = AnnouncementRecord(
+            number=idx,
+            name=(item.get("name_ru") or "").strip(),
+            method=_method_label(item.get("ref_type_trade_id")),
+            start_date=_passthrough_date(item.get("start_date")),
+            end_date=_passthrough_date(item.get("end_date")),
+            sum_amount=_to_float(item.get("price")),
+            status=_status_label(item.get("ref_buy_status_id")),
+            winner_name="",
+            winner_bin="",
+            winner_price=0.0,
+            url=url,
+            has_contracts=False,
+            error="",
+        )
 
-                nav_page.close()
-                nav_page = None
+        try:
+            if ann_id is not None:
+                winner_bin, winner_name = _fetch_winner(token, ann_id)
+            else:
+                winner_bin, winner_name = "", ""
+            record.winner_bin = winner_bin
+            record.winner_name = winner_name
 
-                if not ann_list:
-                    logger.warning("Объявления не найдены для даты: %s", selected_date)
-                    if on_progress:
-                        on_progress(0, 0, "Объявления не найдены")
-                    return result
+            has_contracts = _check_has_contracts(token, number_anno)
+            record.has_contracts = has_contracts
 
-                total = len(ann_list)
-                announcement_page = context.new_page()
-                _setup_page_routes(announcement_page)
+            if not has_contracts:
+                record.winner_price = _fetch_winner_price(
+                    token, number_anno, winner_bin, ann_id
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Ошибка обработки объявления id=%s: %s", ann_id, exc)
+            record.error = f"Ошибка: {exc}"
 
-                for idx, ann_data in enumerate(ann_list, start=1):
-                    if on_progress:
-                        on_progress(idx, total, f"Объявление {idx} из {total}")
+        if (not record.winner_bin and not record.winner_name
+                and not record.has_contracts and not record.error):
+            record.error = "Победитель не найден"
 
-                    if idx > 1 and (idx - 1) % PAGE_RECYCLE_INTERVAL == 0:
-                        try:
-                            announcement_page.close()
-                        except Exception:
-                            pass
-                        announcement_page = context.new_page()
-                        _setup_page_routes(announcement_page)
-                        logger.info("Страница переоткрыта после объявления %d", idx - 1)
+        result.records.append(record)
 
-                    try:
-                        record = parse_announcement(announcement_page, ann_data, idx)
-                    except Exception as exc:
-                        logger.error("Необработанная ошибка объявления %s: %s",
-                                     ann_data.get("url", "?"), exc)
-                        record = AnnouncementRecord(
-                            number=idx,
-                            name=ann_data.get("name", ""),
-                            method=ann_data.get("method", ""),
-                            start_date=ann_data.get("start_date", ""),
-                            end_date=ann_data.get("end_date", ""),
-                            sum_amount=_parse_amount(ann_data.get("sum_amount", "")),
-                            status=ann_data.get("status", ""),
-                            winner_name="",
-                            winner_bin="",
-                            winner_price=0.0,
-                            url=ann_data.get("url", ""),
-                            error=f"Критическая ошибка: {exc}",
-                        )
+        if on_record:
+            try:
+                on_record(record)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("on_record callback error: %s", exc)
 
-                    result.records.append(record)
-
-                    if on_record:
-                        try:
-                            on_record(record)
-                        except Exception as exc:
-                            logger.warning("on_record callback error: %s", exc)
-
-                    if record.error:
-                        result.errors.append(f"{record.url}: {record.error}")
-
-                    _random_delay(REQUEST_DELAY)
-
-            except Exception as exc:
-                logger.error("Критическая ошибка при парсинге объявлений: %s", exc)
-                result.errors.append(str(exc))
-            finally:
-                for p in (nav_page, announcement_page):
-                    if p is not None:
-                        try:
-                            p.close()
-                        except Exception:
-                            pass
-                context.close()
-                browser.close()
-
-    except Exception as exc:
-        logger.error("Ошибка инициализации браузера: %s", exc)
-        result.errors.append(f"Ошибка инициализации браузера: {exc}")
+        if record.error:
+            result.errors.append(f"{record.url}: {record.error}")
 
     return result
 
