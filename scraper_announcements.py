@@ -263,12 +263,14 @@ def _fetch_announcements(
             break
         after = last_id
 
-    # Фильтрация по дате — в Python после получения данных
+    # Фильтрация по дате — в Python после получения данных.
+    # Берём объявления, у которых endDate >= selected_date (по дате,
+    # без учёта времени). selected_date — "YYYY-MM-DD", endDate — "YYYY-MM-DD HH:MM:SS".
     filtered = [
         r for r in items
-        if r.get("endDate") and str(r["endDate"]).startswith(selected_date)
+        if r.get("endDate") and str(r["endDate"])[:10] >= selected_date
     ]
-    logger.info("TrdBuy: получено %d записей, после фильтра по дате %s — %d",
+    logger.info("TrdBuy: получено %d записей, после фильтра endDate >= %s — %d",
                 len(items), selected_date, len(filtered))
     return filtered
 
