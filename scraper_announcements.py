@@ -2,9 +2,9 @@
 scraper_announcements.py — Парсинг закупочных объявлений через GraphQL API v3.
 
 Все данные тянутся прямыми HTTPS-запросами к
-https://ows.goszakup.gov.kz/v3/graphql (объявления и лоты) и
-https://ows.goszakup.gov.kz/v2/graphql (договоры).
-Авторизация — Bearer-токен из env GOSZAKUP_TOKEN или st.secrets["goszakup_token"].
+https://ows.goszakup.gov.kz/v3/graphql.
+Авторизация — Bearer-токен из env GOSZAKUP_TOKEN или st.secrets["goszakup_token"]
+(читается так же как в scraper.py — через _get_token()).
 """
 
 import logging
@@ -27,8 +27,7 @@ except Exception:  # noqa: BLE001
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-GRAPHQL_V3_ENDPOINT = "https://ows.goszakup.gov.kz/v3/graphql"
-GRAPHQL_V2_ENDPOINT = "https://ows.goszakup.gov.kz/v2/graphql"
+GRAPHQL_ENDPOINT = "https://ows.goszakup.gov.kz/v3/graphql"
 REQUEST_TIMEOUT = 60
 RETRY_COUNT = 2
 RETRY_DELAY = 3
@@ -37,24 +36,10 @@ MAX_RECORDS = 10_000
 
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
 
-# 210 = Завершено, 220 = Формирование протокола итогов
-TARGET_STATUS_IDS = [210, 220]
-STATUS_MAP = {
-    210: "Завершено",
-    220: "Формирование протокола итогов",
-}
-
-# 2 = Работа
-TARGET_SUBJECT_IDS = [2]
-
-MIN_SUM_AMOUNT = 1_500_000_000
-
-METHOD_MAP = {
-    1: "Конкурс",
-    2: "Аукцион",
-    3: "Запрос ценовых предложений",
-    4: "Из одного источника",
-}
+# Фильтры объявлений
+TARGET_STATUS_IDS = [210, 220]      # 210 = Завершено, 220 = Формирование протокола итогов
+TARGET_SUBJECT_ID = 2               # 2 = Работа
+TOTAL_SUM_RANGE = [1_500_000_000, 999_999_999_999]
 
 logger = logging.getLogger(__name__)
 
@@ -92,10 +77,11 @@ RecordCallback = Callable[["AnnouncementRecord"], None]
 
 
 # ---------------------------------------------------------------------------
-# Токен авторизации
+# Токен авторизации (читается так же как в scraper.py)
 # ---------------------------------------------------------------------------
 
 def _get_token() -> str:
+    """Читает Bearer-токен из env или st.secrets. Иначе RuntimeError."""
     token = (os.environ.get("GOSZAKUP_TOKEN") or "").strip()
     if token:
         return token
@@ -120,63 +106,44 @@ def _get_token() -> str:
 
 _TRD_BUY_QUERY = """
 query($filter: TrdBuyFiltersInput, $after: Int) {
-  trd_buy(limit: 50, after: $after, filters: $filter) {
+  TrdBuy(limit: 50, filter: $filter, after: $after) {
     id
-    name_ru
-    number_anno
-    ref_buy_status_id
-    start_date
-    end_date
-    price
-    ref_type_trade_id
+    numberAnno
+    nameRu
+    totalSum
+    refBuyStatusId
+    startDate
+    endDate
+    refSubjectTypeId
+    refTradeMethodsId
   }
 }
 """
 
-_LOTS_BY_TRD_BUY_QUERY = """
-query($id: Int) {
-  trd_buy(filters: { id: [$id] }) {
-    id
-    lots {
-      id
-      winner_id
-      winner_bin
-      winner_name_ru
-    }
-  }
-}
-"""
-
-_CONTRACT_EXISTS_QUERY = """
-query($anno: String) {
-  contract(limit: 1, filters: { trd_buy_number_anno: $anno }) {
-    id
-  }
-}
-"""
-
-_CONTRACT_BY_FILTER_QUERY = """
+_CONTRACT_QUERY = """
 query($filter: ContractFiltersInput) {
-  contract(limit: 1, filters: $filter) {
+  Contract(limit: 5, filter: $filter) {
     id
-    contract_sum_wnds
-    supplier_biin
+    supplierBiin
+    contractSumWnds
+    faktSumWnds
+    refContractStatusId
+    descriptionRu
   }
 }
 """
 
-_LOTS_QUERY = """
-query($filter: LotsFiltersInput) {
-  lots(limit: 1, filters: $filter) {
-    id
-    budget
-    winner_price
+_SUBJECTS_QUERY = """
+query($filter: TrdBuyFiltersInput) {
+  Subjects(limit: 1, filter: $filter) {
+    bin
+    nameRu
   }
 }
 """
 
 
-def _graphql_request(endpoint: str, token: str, query: str, variables: dict) -> dict:
+def _graphql_request(token: str, query: str, variables: dict) -> dict:
     payload = {"query": query, "variables": variables}
     headers = {
         "Authorization": f"Bearer {token}",
@@ -187,18 +154,21 @@ def _graphql_request(endpoint: str, token: str, query: str, variables: dict) -> 
     for attempt in range(RETRY_COUNT + 1):
         try:
             resp = requests.post(
-                endpoint, json=payload, headers=headers,
-                timeout=REQUEST_TIMEOUT, verify=False,
+                GRAPHQL_ENDPOINT,
+                json=payload,
+                headers=headers,
+                timeout=REQUEST_TIMEOUT,
+                verify=False,
             )
             resp.raise_for_status()
             return resp.json()
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            logger.warning("GraphQL %s запрос попытка %d/%d: %s",
-                           endpoint, attempt + 1, RETRY_COUNT + 1, exc)
+            logger.warning("GraphQL запрос попытка %d/%d: %s",
+                           attempt + 1, RETRY_COUNT + 1, exc)
             if attempt < RETRY_COUNT:
                 time.sleep(RETRY_DELAY)
-    raise RuntimeError(f"GraphQL запрос {endpoint} завершился ошибкой: {last_exc}")
+    raise RuntimeError(f"GraphQL запрос завершился ошибкой: {last_exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -223,26 +193,32 @@ def _to_int(value) -> int | None:
         return None
 
 
-def _method_label(ref_id) -> str:
-    rid = _to_int(ref_id)
-    if rid is None:
-        return ""
-    return METHOD_MAP.get(rid, str(rid))
+def _status_name(status_id) -> str:
+    sid = _to_int(status_id)
+    if sid is None:
+        return str(status_id) if status_id is not None else ""
+    return {
+        210: "Завершено",
+        220: "Формирование протокола итогов",
+    }.get(sid, str(sid))
 
 
-def _status_label(ref_id) -> str:
-    rid = _to_int(ref_id)
-    if rid is None:
-        return ""
-    return STATUS_MAP.get(rid, str(rid))
-
-
-def _passthrough_date(s: str | None) -> str:
-    return (s or "").strip()
+def _method_name(method_id) -> str:
+    mid = _to_int(method_id)
+    if mid is None:
+        return str(method_id) if method_id is not None else ""
+    return {
+        1: "Конкурс",
+        2: "Аукцион",
+        3: "Запрос ценовых предложений",
+        4: "Из одного источника",
+        5: "Запрос предложений",
+        6: "Закупка из одного источника",
+    }.get(mid, f"Способ {mid}")
 
 
 # ---------------------------------------------------------------------------
-# Шаг 1 — список объявлений (с пагинацией)
+# Шаг 1 — список объявлений (с пагинацией; дата фильтруется в Python)
 # ---------------------------------------------------------------------------
 
 def _fetch_announcements(
@@ -250,13 +226,13 @@ def _fetch_announcements(
     selected_date: str,
     errors_sink: list[str],
 ) -> list[dict]:
+    """Тянет все объявления по фильтру (status+subject+totalSum), затем фильтрует по дате."""
     items: list[dict] = []
     after: int | None = None
     filter_input = {
-        "ref_buy_status_id": TARGET_STATUS_IDS,
-        "ref_subject_type_id": TARGET_SUBJECT_IDS,
-        "end_date_gte": selected_date,
-        "price_gte": MIN_SUM_AMOUNT,
+        "refBuyStatusId": TARGET_STATUS_IDS,
+        "refSubjectTypeId": TARGET_SUBJECT_ID,
+        "totalSum": TOTAL_SUM_RANGE,
     }
 
     while True:
@@ -265,11 +241,9 @@ def _fetch_announcements(
             variables["after"] = after
 
         try:
-            response = _graphql_request(
-                GRAPHQL_V3_ENDPOINT, token, _TRD_BUY_QUERY, variables
-            )
+            response = _graphql_request(token, _TRD_BUY_QUERY, variables)
         except Exception as exc:  # noqa: BLE001
-            errors_sink.append(f"trd_buy: {exc}")
+            errors_sink.append(f"TrdBuy: {exc}")
             break
 
         gql_errors = response.get("errors")
@@ -278,7 +252,7 @@ def _fetch_announcements(
             errors_sink.append(f"GraphQL error: {msg}")
             break
 
-        batch = (response.get("data") or {}).get("trd_buy") or []
+        batch = (response.get("data") or {}).get("TrdBuy") or []
         items.extend(batch)
 
         page_info = (response.get("extensions") or {}).get("pageInfo") or {}
@@ -289,101 +263,55 @@ def _fetch_announcements(
             break
         after = last_id
 
-    return items
+    # Фильтрация по дате — в Python после получения данных
+    filtered = [
+        r for r in items
+        if r.get("endDate") and str(r["endDate"]).startswith(selected_date)
+    ]
+    logger.info("TrdBuy: получено %d записей, после фильтра по дате %s — %d",
+                len(items), selected_date, len(filtered))
+    return filtered
 
 
 # ---------------------------------------------------------------------------
-# Шаг 2 — победитель
+# Шаг 2 — победитель и наличие договоров
 # ---------------------------------------------------------------------------
 
-def _fetch_winner(token: str, ann_id: int) -> tuple[str, str]:
-    """Возвращает (winner_bin, winner_name_ru) или ('', '')."""
-    try:
-        resp = _graphql_request(
-            GRAPHQL_V3_ENDPOINT, token, _LOTS_BY_TRD_BUY_QUERY,
-            {"id": int(ann_id)},
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("_fetch_winner(id=%s) ошибка: %s", ann_id, exc)
-        return "", ""
-
-    trd = (resp.get("data") or {}).get("trd_buy") or []
-    if not trd:
-        return "", ""
-    lots = trd[0].get("lots") or []
-    for lot in lots:
-        bin_value = (lot.get("winner_bin") or "").strip()
-        name_value = (lot.get("winner_name_ru") or "").strip()
-        if bin_value:
-            return bin_value, name_value
-    return "", ""
-
-
-# ---------------------------------------------------------------------------
-# Шаг 3 — проверка наличия договоров
-# ---------------------------------------------------------------------------
-
-def _check_has_contracts(token: str, number_anno: str) -> bool:
+def _fetch_contracts_for_anno(token: str, number_anno: str) -> list[dict]:
     if not number_anno:
-        return False
+        return []
     try:
         resp = _graphql_request(
-            GRAPHQL_V2_ENDPOINT, token, _CONTRACT_EXISTS_QUERY,
-            {"anno": number_anno},
+            token, _CONTRACT_QUERY,
+            {"filter": {"trdBuyNumberAnno": number_anno}},
         )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("_check_has_contracts(%s) ошибка: %s", number_anno, exc)
-        return False
-    contracts = (resp.get("data") or {}).get("contract") or []
-    return bool(contracts)
+        logger.warning("Contract(trdBuyNumberAnno=%s) ошибка: %s", number_anno, exc)
+        return []
+    return (resp.get("data") or {}).get("Contract") or []
 
 
 # ---------------------------------------------------------------------------
-# Шаг 4 — цена победителя
+# Шаг 3 — наименование победителя
 # ---------------------------------------------------------------------------
 
-def _fetch_winner_price(
-    token: str,
-    number_anno: str,
-    winner_bin: str,
-    ann_id: int | None,
-) -> float:
-    # 4а) Договор по объявлению + БИН поставщика
-    if number_anno and winner_bin:
-        try:
-            resp = _graphql_request(
-                GRAPHQL_V2_ENDPOINT, token, _CONTRACT_BY_FILTER_QUERY,
-                {"filter": {
-                    "trd_buy_number_anno": number_anno,
-                    "supplier_biin": winner_bin,
-                }},
-            )
-            contracts = (resp.get("data") or {}).get("contract") or []
-            if contracts:
-                amount = _to_float(contracts[0].get("contract_sum_wnds"))
-                if amount > 0:
-                    return amount
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("_fetch_winner_price contract ошибка: %s", exc)
+def _fetch_subject_name(token: str, winner_bin: str) -> str:
+    if not winner_bin:
+        return ""
+    try:
+        resp = _graphql_request(
+            token, _SUBJECTS_QUERY,
+            {"filter": {"bin": winner_bin}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Subjects(bin=%s) ошибка: %s", winner_bin, exc)
+        return ""
 
-    # 4б) Фолбэк — данные лота
-    if ann_id is not None:
-        try:
-            resp = _graphql_request(
-                GRAPHQL_V3_ENDPOINT, token, _LOTS_QUERY,
-                {"filter": {"trd_buy_id": [int(ann_id)]}},
-            )
-            lots = (resp.get("data") or {}).get("lots") or []
-            if lots:
-                lot = lots[0]
-                for key in ("winner_price", "budget"):
-                    value = _to_float(lot.get(key))
-                    if value > 0:
-                        return value
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("_fetch_winner_price lots ошибка: %s", exc)
-
-    return 0.0
+    subjects = (resp.get("data") or {}).get("Subjects") or []
+    if not subjects:
+        return ""
+    name = (subjects[0].get("nameRu") or "").strip()
+    return name
 
 
 # ---------------------------------------------------------------------------
@@ -435,17 +363,17 @@ def scrape_announcements(
                 pass
 
         ann_id = _to_int(item.get("id"))
-        number_anno = (item.get("number_anno") or "").strip()
+        number_anno = (item.get("numberAnno") or "").strip()
         url = ANNOUNCEMENT_URL_TEMPLATE.format(id=ann_id) if ann_id is not None else ""
 
         record = AnnouncementRecord(
             number=idx,
-            name=(item.get("name_ru") or "").strip(),
-            method=_method_label(item.get("ref_type_trade_id")),
-            start_date=_passthrough_date(item.get("start_date")),
-            end_date=_passthrough_date(item.get("end_date")),
-            sum_amount=_to_float(item.get("price")),
-            status=_status_label(item.get("ref_buy_status_id")),
+            name=(item.get("nameRu") or "").strip(),
+            method=_method_name(item.get("refTradeMethodsId")),
+            start_date=(item.get("startDate") or "").strip(),
+            end_date=(item.get("endDate") or "").strip(),
+            sum_amount=_to_float(item.get("totalSum")),
+            status=_status_name(item.get("refBuyStatusId")),
             winner_name="",
             winner_bin="",
             winner_price=0.0,
@@ -455,20 +383,26 @@ def scrape_announcements(
         )
 
         try:
-            if ann_id is not None:
-                winner_bin, winner_name = _fetch_winner(token, ann_id)
-            else:
-                winner_bin, winner_name = "", ""
-            record.winner_bin = winner_bin
-            record.winner_name = winner_name
-
-            has_contracts = _check_has_contracts(token, number_anno)
+            contracts = _fetch_contracts_for_anno(token, number_anno)
+            has_contracts = len(contracts) > 0
             record.has_contracts = has_contracts
 
-            if not has_contracts:
-                record.winner_price = _fetch_winner_price(
-                    token, number_anno, winner_bin, ann_id
-                )
+            if has_contracts:
+                # Победитель: первый договор у которого supplierBiin не пустой
+                for c in contracts:
+                    biin = (c.get("supplierBiin") or "").strip()
+                    if biin:
+                        record.winner_bin = biin
+                        break
+                # has_contracts=True → winner_price = 0.0 (Excel-слой скроет колонку)
+                record.winner_price = 0.0
+            else:
+                # has_contracts=False → договоров нет, источника контрактной суммы нет
+                record.winner_price = 0.0
+
+            # Шаг 3: имя победителя через Subjects
+            if record.winner_bin:
+                record.winner_name = _fetch_subject_name(token, record.winner_bin)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка обработки объявления id=%s: %s", ann_id, exc)
             record.error = f"Ошибка: {exc}"
