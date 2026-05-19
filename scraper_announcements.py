@@ -3,8 +3,8 @@ scraper_announcements.py — Парсинг закупочных объявле�
 
 Все данные тянутся прямыми HTTPS-запросами к
 https://ows.goszakup.gov.kz/v3/graphql.
-Авторизация — Bearer-токен из env GOSZAKUP_TOKEN или st.secrets["goszakup_token"]
-(читается так же как в scraper.py — через _get_token()).
+Победитель и цена извлекаются из HTML-протокола итогов,
+который скачивается через API по ссылке из Files объявления.
 """
 
 import logging
@@ -15,6 +15,7 @@ from typing import Callable
 
 import requests
 import urllib3
+from bs4 import BeautifulSoup
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -29,6 +30,7 @@ except Exception:  # noqa: BLE001
 
 GRAPHQL_ENDPOINT = "https://ows.goszakup.gov.kz/v3/graphql"
 REQUEST_TIMEOUT = 60
+PROTOCOL_TIMEOUT = 30
 RETRY_COUNT = 2
 RETRY_DELAY = 3
 PAGE_LIMIT = 50
@@ -77,7 +79,7 @@ RecordCallback = Callable[["AnnouncementRecord"], None]
 
 
 # ---------------------------------------------------------------------------
-# Токен авторизации (читается так же как в scraper.py)
+# Токен авторизации
 # ---------------------------------------------------------------------------
 
 def _get_token() -> str:
@@ -116,6 +118,20 @@ query($filter: TrdBuyFiltersInput, $after: Int) {
     endDate
     refSubjectTypeId
     refTradeMethodsId
+  }
+}
+"""
+
+_TRD_BUY_FILES_QUERY = """
+query($filter: TrdBuyFiltersInput) {
+  TrdBuy(limit: 1, filter: $filter) {
+    id
+    numberAnno
+    Files {
+      id
+      nameRu
+      filePath
+    }
   }
 }
 """
@@ -263,9 +279,7 @@ def _fetch_announcements(
             break
         after = last_id
 
-    # Фильтрация по дате — в Python после получения данных.
-    # Берём объявления, у которых endDate >= selected_date (по дате,
-    # без учёта времени). selected_date — "YYYY-MM-DD", endDate — "YYYY-MM-DD HH:MM:SS".
+    # Фильтрация по дате — берём объявления где endDate >= selected_date
     filtered = [
         r for r in items
         if r.get("endDate") and str(r["endDate"])[:10] >= selected_date
@@ -276,7 +290,7 @@ def _fetch_announcements(
 
 
 # ---------------------------------------------------------------------------
-# Шаг 2 — победитель и наличие договоров
+# Шаг 2 — наличие договоров по номеру объявления
 # ---------------------------------------------------------------------------
 
 def _fetch_contracts_for_anno(token: str, number_anno: str) -> list[dict]:
@@ -294,7 +308,121 @@ def _fetch_contracts_for_anno(token: str, number_anno: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3 — наименование победителя
+# Шаг 3 — файлы объявления (протокол итогов)
+# ---------------------------------------------------------------------------
+
+def _fetch_files_for_anno(token: str, ann_id: int) -> list[dict]:
+    """Получает список файлов объявления через GraphQL."""
+    if not ann_id:
+        return []
+    try:
+        resp = _graphql_request(
+            token, _TRD_BUY_FILES_QUERY,
+            {"filter": {"id": [ann_id]}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("TrdBuy Files(id=%s) ошибка: %s", ann_id, exc)
+        return []
+    items = (resp.get("data") or {}).get("TrdBuy") or []
+    if not items:
+        return []
+    return items[0].get("Files") or []
+
+
+def _download_protocol(token: str, url: str):
+    """Скачивает HTML протокол и возвращает BeautifulSoup объект. При ошибке — None."""
+    if not url:
+        return None
+    try:
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            verify=False,
+            timeout=PROTOCOL_TIMEOUT,
+        )
+        r.raise_for_status()
+        return BeautifulSoup(r.content, "html.parser")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка скачивания протокола %s: %s", url, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Шаг 4 — парсинг HTML протокола: победитель и цена
+# ---------------------------------------------------------------------------
+
+def _find_winner_from_protocol(tables) -> tuple[str, str]:
+    """
+    Ищет таблицу победителя в HTML протоколе.
+    Возвращает (winner_name, winner_bin).
+    Таблица победителя содержит 'победител' или 'жеңімпаз' в заголовке.
+    Победитель — первая строка данных: cells[1]=название, cells[2]=БИН.
+    """
+    for table in tables:
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header_text = rows[0].get_text().lower()
+        if "победител" not in header_text and "жеңімпаз" not in header_text:
+            continue
+        # Перебираем строки данных (пропускаем нумерацию "1 | 2 | 3 | ...")
+        for row in rows[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if len(cells) < 3:
+                continue
+            # Пропускаем строку-нумерацию "1 | 2 | 3 | ..."
+            if cells[0] in ("1", "№") and cells[1] in ("2", "Наименование", "Атауы"):
+                continue
+            name = cells[1].strip()
+            bin_val = cells[2].strip()
+            # БИН должен быть 12 цифр
+            if name and bin_val and bin_val.replace(" ", "").isdigit():
+                bin_clean = bin_val.replace(" ", "")
+                if len(bin_clean) == 12:
+                    return name, bin_clean
+    return "", ""
+
+
+def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
+    """
+    Ищет цену победителя в таблице расчёта условных цен.
+    Заголовок таблицы содержит 'цена поставщика' или 'өнім берушінің бағасы'.
+    Находит строку с БИН победителя, берёт столбец 'Цена поставщика' (индекс 4).
+    """
+    if not winner_bin:
+        return 0.0
+
+    for table in tables:
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header_text = rows[0].get_text().lower()
+        if ("цена поставщика" not in header_text
+                and "өнім берушінің бағасы" not in header_text):
+            continue
+        for row in rows[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if len(cells) < 5:
+                continue
+            # Пропускаем строку-нумерацию
+            if cells[0] in ("1", "№") and cells[1] in ("2", "Наименование", "Атауы"):
+                continue
+            # БИН в столбце 2 (индекс 2)
+            bin_val = cells[2].replace(" ", "").strip()
+            if bin_val == winner_bin:
+                try:
+                    # Цена поставщика в столбце 4 (индекс 4)
+                    price_str = cells[4].replace(" ", "").replace("\xa0", "").replace(",", ".")
+                    price = float(price_str)
+                    if price > 0:
+                        return price
+                except (ValueError, IndexError):
+                    pass
+    return 0.0
+
+
+# ---------------------------------------------------------------------------
+# Шаг 5 — наименование победителя через Subjects API
 # ---------------------------------------------------------------------------
 
 def _fetch_subject_name(token: str, winner_bin: str) -> str:
@@ -312,8 +440,7 @@ def _fetch_subject_name(token: str, winner_bin: str) -> str:
     subjects = (resp.get("data") or {}).get("Subjects") or []
     if not subjects:
         return ""
-    name = (subjects[0].get("nameRu") or "").strip()
-    return name
+    return (subjects[0].get("nameRu") or "").strip()
 
 
 # ---------------------------------------------------------------------------
@@ -385,30 +512,61 @@ def scrape_announcements(
         )
 
         try:
+            # ── Шаг 1: проверяем наличие договоров ──────────────────────────
             contracts = _fetch_contracts_for_anno(token, number_anno)
             has_contracts = len(contracts) > 0
             record.has_contracts = has_contracts
 
             if has_contracts:
-                # Победитель: первый договор у которого supplierBiin не пустой
+                # Берём БИН из первого договора с непустым supplierBiin
                 for c in contracts:
                     biin = (c.get("supplierBiin") or "").strip()
                     if biin:
                         record.winner_bin = biin
                         break
-                # has_contracts=True → winner_price = 0.0 (Excel-слой скроет колонку)
-                record.winner_price = 0.0
-            else:
-                # has_contracts=False → договоров нет, источника контрактной суммы нет
-                record.winner_price = 0.0
 
-            # Шаг 3: имя победителя через Subjects
-            if record.winner_bin:
+            # ── Шаг 2: получаем файлы объявления и ищем протокол итогов ────
+            protocol_soup = None
+            if ann_id is not None:
+                files = _fetch_files_for_anno(token, ann_id)
+                protocol_url = None
+                for f in files:
+                    file_name = (f.get("nameRu") or "").lower()
+                    if "протокол итогов" in file_name:
+                        protocol_url = f.get("filePath")
+                        break
+
+                if protocol_url:
+                    logger.info("Скачиваем протокол для объявления id=%s", ann_id)
+                    protocol_soup = _download_protocol(token, protocol_url)
+
+            # ── Шаг 3: парсим протокол — победитель и цена ──────────────────
+            if protocol_soup is not None:
+                tables = protocol_soup.find_all("table")
+
+                # Победитель из протокола
+                proto_name, proto_bin = _find_winner_from_protocol(tables)
+                if proto_name:
+                    record.winner_name = proto_name
+                if proto_bin:
+                    # Протокол приоритетнее договора для БИН
+                    record.winner_bin = proto_bin
+
+                # Цена только если нет договоров
+                if not has_contracts and record.winner_bin:
+                    record.winner_price = _find_winner_price_from_protocol(
+                        tables, record.winner_bin
+                    )
+
+            # ── Шаг 4: если имя ещё не найдено — пробуем через Subjects API ─
+            if record.winner_bin and not record.winner_name:
                 record.winner_name = _fetch_subject_name(token, record.winner_bin)
+
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка обработки объявления id=%s: %s", ann_id, exc)
             record.error = f"Ошибка: {exc}"
 
+        # Помечаем если победитель не найден совсем
         if (not record.winner_bin and not record.winner_name
                 and not record.has_contracts and not record.error):
             record.error = "Победитель не найден"
@@ -435,7 +593,7 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
-    test_date = sys.argv[1] if len(sys.argv) > 1 else "2024-01-15"
+    test_date = sys.argv[1] if len(sys.argv) > 1 else "2026-05-01"
 
     def _progress(current: int, total: int, msg: str) -> None:
         print(f"  [{current}/{total}] {msg}")

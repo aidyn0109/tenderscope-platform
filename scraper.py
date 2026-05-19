@@ -102,8 +102,8 @@ query($filter: ContractFiltersInput, $after: Int) {
     id
     contract_number_sys
     description_ru
-    contract_sum_wnds
-    fakt_sum_wnds
+    contract_sum
+    fakt_sum
     ref_contract_status_id
     supplier_biin
     sign_date
@@ -177,8 +177,8 @@ def _to_float(value) -> float:
 
 def _contract_record_from_item(item: dict, bin_number: str) -> ContractRecord:
     cid = item.get("id")
-    amount_final = _to_float(item.get("contract_sum_wnds"))
-    amount_actual = _to_float(item.get("fakt_sum_wnds"))
+    amount_final = _to_float(item.get("contract_sum"))
+    amount_actual = _to_float(item.get("fakt_sum"))
     description = (item.get("description_ru") or "").strip() or "(описание отсутствует)"
     url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
     return ContractRecord(
