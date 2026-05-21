@@ -278,12 +278,12 @@ def _fetch_announcements(
             break
         after = last_id
 
-    # Фильтр по дате: endDate >= selected_date
+    # Фильтр по дате: точное совпадение endDate == selected_date
     filtered = [
         r for r in items
-        if r.get("endDate") and str(r["endDate"])[:10] >= selected_date
+        if r.get("endDate") and str(r["endDate"])[:10] == selected_date
     ]
-    logger.info("TrdBuy: получено %d записей, после фильтра endDate >= %s — %d",
+    logger.info("TrdBuy: получено %d записей, после фильтра endDate == %s — %d",
                 len(items), selected_date, len(filtered))
     return filtered
 
@@ -395,43 +395,127 @@ def _find_winner_from_protocol(tables) -> tuple[str, str]:
     return "", ""
 
 
+def _clean_number(s: str) -> float:
+    """Очищает строку с числом и конвертирует в float."""
+    cleaned = (s.replace("\xa0", "")
+                .replace(" ", "")
+                .replace("\u202f", "")
+                .replace(",", "."))
+    return float(cleaned)
+
+
+def _find_bin_col(rows: list, winner_bin: str) -> int | None:
+    """
+    Находит индекс столбца содержащего БИН победителя в строках данных.
+    Возвращает индекс или None.
+    """
+    for row in rows:
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if _is_numbering_row(cells):
+            continue
+        for i, cell in enumerate(cells):
+            if cell.replace(" ", "").strip() == winner_bin:
+                return i
+    return None
+
+
 def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
     """
-    Ищет цену победителя в таблице расчёта условных цен.
-    Заголовок содержит 'цена поставщика' или 'өнім берушінің бағасы'.
-    Строка победителя определяется по БИН в столбце 2 (индекс 2).
-    Цена — столбец 4 (индекс 4).
+    Ищет цену победителя в протоколе.
+
+    Поддерживает два типа протоколов:
+
+    Тип 1 — обычный конкурс (условные скидки):
+      Заголовок таблицы содержит 'цена поставщика' / 'өнім берушінің бағасы'.
+      Цена — в столбце ПОСЛЕ столбца с БИН (обычно индекс bin_col+2).
+
+    Тип 2 — рейтингово-балльная система:
+      Заголовок таблицы содержит 'суммарное количество баллов' / 'баллдардың жиынтық саны'
+      И 'выделенная сумма' / 'бөлінген сома'.
+      Цена (выделенная сумма) — в столбце сразу ПОСЛЕ столбца с БИН (bin_col+1).
     """
     if not winner_bin:
         return 0.0
 
+    # Тип 1: таблица с "цена поставщика"
     for table in tables:
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
-        header_text = rows[0].get_text().lower()
+        # Собираем полный текст всех заголовочных строк
+        header_text = " ".join(
+            rows[i].get_text(" ", strip=True).lower()
+            for i in range(min(3, len(rows)))
+        )
         if ("цена поставщика" not in header_text
                 and "өнім берушінің бағасы" not in header_text):
             continue
 
-        for row in rows[1:]:
+        data_rows = rows[1:]
+        bin_col = _find_bin_col(data_rows, winner_bin)
+        if bin_col is None:
+            continue
+
+        # Цена поставщика — через 2 столбца после БИН (индекс bin_col+2)
+        # Структура: № | Наименование | БИН | Выделенная сумма | Цена поставщика | ...
+        price_col = bin_col + 2
+        for row in data_rows:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-            if len(cells) < 5:
-                continue
             if _is_numbering_row(cells):
                 continue
-            bin_val = cells[2].replace(" ", "").strip()
+            if len(cells) <= price_col:
+                continue
+            bin_val = cells[bin_col].replace(" ", "").strip()
             if bin_val == winner_bin:
                 try:
-                    price_str = (cells[4]
-                                 .replace("\xa0", "")
-                                 .replace(" ", "")
-                                 .replace(",", "."))
-                    price = float(price_str)
+                    price = _clean_number(cells[price_col])
                     if price > 0:
+                        logger.info("Тип 1: цена победителя %s = %.2f", winner_bin, price)
                         return price
                 except (ValueError, IndexError):
                     pass
+
+    # Тип 2: рейтингово-балльная — таблица с "выделенная сумма" + "баллов"
+    for table in tables:
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header_text = " ".join(
+            rows[i].get_text(" ", strip=True).lower()
+            for i in range(min(3, len(rows)))
+        )
+        # Признаки рейтингово-балльной таблицы
+        has_balls = ("суммарное количество баллов" in header_text
+                     or "баллдардың жиынтық саны" in header_text)
+        has_sum = ("выделенная сумма" in header_text
+                   or "бөлінген сома" in header_text)
+        if not (has_balls and has_sum):
+            continue
+
+        data_rows = rows[1:]
+        bin_col = _find_bin_col(data_rows, winner_bin)
+        if bin_col is None:
+            continue
+
+        # Выделенная сумма — сразу после БИН (bin_col+1)
+        price_col = bin_col + 1
+        for row in data_rows:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if _is_numbering_row(cells):
+                continue
+            if len(cells) <= price_col:
+                continue
+            bin_val = cells[bin_col].replace(" ", "").strip()
+            if bin_val == winner_bin:
+                try:
+                    price = _clean_number(cells[price_col])
+                    if price > 0:
+                        logger.info("Тип 2: выделенная сумма победителя %s = %.2f",
+                                    winner_bin, price)
+                        return price
+                except (ValueError, IndexError):
+                    pass
+
     return 0.0
 
 
