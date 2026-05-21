@@ -37,8 +37,8 @@ MAX_RECORDS = 10_000
 
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
 
-# Статусы: 210=Завершено, 220=Формирование протокола итогов, 350=Договор подписан
-TARGET_STATUS_IDS = [210, 220, 350]
+# Статусы: 210=Завершено, 220=Формирование протокола итогов, 330=Итоги опубликованы, 350=Договор подписан
+TARGET_STATUS_IDS = [210, 220, 330, 350]
 TARGET_SUBJECT_ID = 2               # 2 = Работа
 TOTAL_SUM_RANGE = [1_500_000_000, 999_999_999_999]
 
@@ -212,6 +212,7 @@ def _status_name(status_id) -> str:
     return {
         210: "Завершено",
         220: "Формирование протокола итогов",
+        330: "Итоги опубликованы",
         350: "Договор подписан",
     }.get(sid, str(sid))
 
@@ -278,12 +279,12 @@ def _fetch_announcements(
             break
         after = last_id
 
-    # Фильтр по дате: точное совпадение endDate == selected_date
+    # Фильтр по дате: endDate >= selected_date (как на сайте: "окончание приёма заявок С даты")
     filtered = [
         r for r in items
-        if r.get("endDate") and str(r["endDate"])[:10] == selected_date
+        if r.get("endDate") and str(r["endDate"])[:10] >= selected_date
     ]
-    logger.info("TrdBuy: получено %d записей, после фильтра endDate == %s — %d",
+    logger.info("TrdBuy: получено %d записей, после фильтра endDate >= %s — %d",
                 len(items), selected_date, len(filtered))
     return filtered
 
