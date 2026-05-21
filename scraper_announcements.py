@@ -1,10 +1,9 @@
 """
 scraper_announcements.py — Парсинг закупочных объявлений через GraphQL API v3.
 
-Все данные тянутся прямыми HTTPS-запросами к
-https://ows.goszakup.gov.kz/v3/graphql.
-Победитель и цена извлекаются из HTML-протокола итогов,
-который скачивается через API по ссылке из Files объявления.
+Фильтрация по диапазону дат публикации итогов (itogiDatePublic),
+что соответствует полю "Протокол итогов с/по" на сайте госзакупок.
+Победитель и цена извлекаются из HTML-протокола итогов.
 """
 
 import logging
@@ -37,7 +36,7 @@ MAX_RECORDS = 10_000
 
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
 
-# Статусы: 210=Завершено, 220=Формирование протокола итогов, 330=Итоги опубликованы, 350=Договор подписан
+# Статусы: 330=Итоги опубликованы, 350=Договор подписан
 TARGET_STATUS_IDS = [210, 220, 330, 350]
 TARGET_SUBJECT_ID = 2               # 2 = Работа
 TOTAL_SUM_RANGE = [1_500_000_000, 999_999_999_999]
@@ -114,6 +113,7 @@ query($filter: TrdBuyFiltersInput, $after: Int) {
     refBuyStatusId
     startDate
     endDate
+    itogiDatePublic
     refSubjectTypeId
     refTradeMethodsId
   }
@@ -234,15 +234,20 @@ def _method_name(method_id) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Шаг 1 — список объявлений
+# Шаг 1 — список объявлений с фильтром по itogiDatePublic
 # ---------------------------------------------------------------------------
 
 def _fetch_announcements(
     token: str,
-    selected_date: str,
+    date_from: str,
+    date_to: str,
     errors_sink: list[str],
 ) -> list[dict]:
-    """Тянет объявления по фильтру, фильтрует по дате в Python."""
+    """
+    Тянет объявления по фильтру статус+предмет+сумма,
+    затем фильтрует по itogiDatePublic в Python.
+    date_from, date_to — строки "YYYY-MM-DD".
+    """
     items: list[dict] = []
     after: int | None = None
     filter_input = {
@@ -279,13 +284,16 @@ def _fetch_announcements(
             break
         after = last_id
 
-    # Фильтр по дате: endDate >= selected_date (как на сайте: "окончание приёма заявок С даты")
+    # Фильтр по itogiDatePublic (дата публикации итогов) в диапазоне [date_from, date_to]
     filtered = [
         r for r in items
-        if r.get("endDate") and str(r["endDate"])[:10] >= selected_date
+        if r.get("itogiDatePublic")
+        and date_from <= str(r["itogiDatePublic"])[:10] <= date_to
     ]
-    logger.info("TrdBuy: получено %d записей, после фильтра endDate >= %s — %d",
-                len(items), selected_date, len(filtered))
+    logger.info(
+        "TrdBuy: получено %d записей, после фильтра itogiDatePublic [%s, %s] — %d",
+        len(items), date_from, date_to, len(filtered),
+    )
     return filtered
 
 
@@ -308,7 +316,7 @@ def _fetch_contracts_for_anno(token: str, number_anno: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3 — файлы объявления
+# Шаг 3 — файлы объявления и протокол итогов
 # ---------------------------------------------------------------------------
 
 def _fetch_files_for_anno(token: str, ann_id: int) -> list[dict]:
@@ -354,7 +362,6 @@ def _is_numbering_row(cells: list[str]) -> bool:
     """Проверяет что строка является нумерацией столбцов '1 | 2 | 3 | ...'"""
     if not cells:
         return False
-    # Строка нумерации: все непустые ячейки — числа от 1 до 20
     non_empty = [c for c in cells if c.strip()]
     if not non_empty:
         return False
@@ -365,12 +372,32 @@ def _is_numbering_row(cells: list[str]) -> bool:
         return False
 
 
+def _clean_number(s: str) -> float:
+    """Очищает строку с числом и конвертирует в float."""
+    cleaned = (s.replace("\xa0", "")
+                .replace(" ", "")
+                .replace("\u202f", "")
+                .replace(",", "."))
+    return float(cleaned)
+
+
+def _find_bin_col(rows: list, winner_bin: str) -> int | None:
+    """Находит индекс столбца содержащего БИН победителя."""
+    for row in rows:
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if _is_numbering_row(cells):
+            continue
+        for i, cell in enumerate(cells):
+            if cell.replace(" ", "").strip() == winner_bin:
+                return i
+    return None
+
+
 def _find_winner_from_protocol(tables) -> tuple[str, str]:
     """
     Ищет победителя в HTML протоколе.
     Возвращает (winner_name, winner_bin).
     Таблица победителя содержит 'победител' или 'жеңімпаз' в заголовке.
-    Победитель — первая строка данных (не нумерация): cells[1]=название, cells[2]=БИН.
     """
     for table in tables:
         rows = table.find_all("tr")
@@ -384,56 +411,27 @@ def _find_winner_from_protocol(tables) -> tuple[str, str]:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
             if len(cells) < 3:
                 continue
-            # Пропускаем строку-нумерацию "1 | 2 | 3 | ..."
             if _is_numbering_row(cells):
                 continue
             name = cells[1].strip()
             bin_val = cells[2].replace(" ", "").strip()
-            # БИН должен быть 12 цифр
             if name and bin_val.isdigit() and len(bin_val) == 12:
                 return name, bin_val
 
     return "", ""
 
 
-def _clean_number(s: str) -> float:
-    """Очищает строку с числом и конвертирует в float."""
-    cleaned = (s.replace("\xa0", "")
-                .replace(" ", "")
-                .replace("\u202f", "")
-                .replace(",", "."))
-    return float(cleaned)
-
-
-def _find_bin_col(rows: list, winner_bin: str) -> int | None:
-    """
-    Находит индекс столбца содержащего БИН победителя в строках данных.
-    Возвращает индекс или None.
-    """
-    for row in rows:
-        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
-        if _is_numbering_row(cells):
-            continue
-        for i, cell in enumerate(cells):
-            if cell.replace(" ", "").strip() == winner_bin:
-                return i
-    return None
-
-
 def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
     """
     Ищет цену победителя в протоколе.
 
-    Поддерживает два типа протоколов:
-
     Тип 1 — обычный конкурс (условные скидки):
-      Заголовок таблицы содержит 'цена поставщика' / 'өнім берушінің бағасы'.
-      Цена — в столбце ПОСЛЕ столбца с БИН (обычно индекс bin_col+2).
+      Заголовок содержит 'цена поставщика' / 'өнім берушінің бағасы'.
+      Цена в столбце bin_col+2.
 
     Тип 2 — рейтингово-балльная система:
-      Заголовок таблицы содержит 'суммарное количество баллов' / 'баллдардың жиынтық саны'
-      И 'выделенная сумма' / 'бөлінген сома'.
-      Цена (выделенная сумма) — в столбце сразу ПОСЛЕ столбца с БИН (bin_col+1).
+      Заголовок содержит 'суммарное количество баллов' + 'выделенная сумма'.
+      Цена (выделенная сумма) в столбце bin_col+1.
     """
     if not winner_bin:
         return 0.0
@@ -443,7 +441,6 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
         rows = table.find_all("tr")
         if len(rows) < 2:
             continue
-        # Собираем полный текст всех заголовочных строк
         header_text = " ".join(
             rows[i].get_text(" ", strip=True).lower()
             for i in range(min(3, len(rows)))
@@ -457,8 +454,6 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
         if bin_col is None:
             continue
 
-        # Цена поставщика — через 2 столбца после БИН (индекс bin_col+2)
-        # Структура: № | Наименование | БИН | Выделенная сумма | Цена поставщика | ...
         price_col = bin_col + 2
         for row in data_rows:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
@@ -476,7 +471,7 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
                 except (ValueError, IndexError):
                     pass
 
-    # Тип 2: рейтингово-балльная — таблица с "выделенная сумма" + "баллов"
+    # Тип 2: рейтингово-балльная система
     for table in tables:
         rows = table.find_all("tr")
         if len(rows) < 2:
@@ -485,7 +480,6 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
             rows[i].get_text(" ", strip=True).lower()
             for i in range(min(3, len(rows)))
         )
-        # Признаки рейтингово-балльной таблицы
         has_balls = ("суммарное количество баллов" in header_text
                      or "баллдардың жиынтық саны" in header_text)
         has_sum = ("выделенная сумма" in header_text
@@ -498,7 +492,6 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
         if bin_col is None:
             continue
 
-        # Выделенная сумма — сразу после БИН (bin_col+1)
         price_col = bin_col + 1
         for row in data_rows:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
@@ -549,8 +542,16 @@ def scrape_announcements(
     selected_date: str,
     on_progress: ProgressCallback | None = None,
     on_record: RecordCallback | None = None,
+    date_to: str | None = None,
 ) -> ScrapeAnnouncementsResult:
-    """Главная функция парсинга объявлений. selected_date — строка 'YYYY-MM-DD'."""
+    """
+    Главная функция парсинга объявлений.
+    selected_date — дата "с" (YYYY-MM-DD), date_to — дата "по" (YYYY-MM-DD).
+    Если date_to не передан — используется selected_date (один день).
+    """
+    # Если date_to не передан — диапазон из одного дня
+    effective_date_to = date_to if date_to else selected_date
+
     result = ScrapeAnnouncementsResult(selected_date=selected_date)
 
     try:
@@ -570,10 +571,11 @@ def scrape_announcements(
         except Exception:  # noqa: BLE001
             pass
 
-    items = _fetch_announcements(token, selected_date, result.errors)
+    items = _fetch_announcements(token, selected_date, effective_date_to, result.errors)
 
     if not items:
-        logger.warning("Объявления не найдены для даты: %s", selected_date)
+        logger.warning("Объявления не найдены для диапазона: %s — %s",
+                       selected_date, effective_date_to)
         if on_progress:
             try:
                 on_progress(0, 0, "Объявления не найдены")
@@ -610,11 +612,10 @@ def scrape_announcements(
         )
 
         try:
-            # ── Шаг 1: проверяем наличие договоров ──────────────────────────
+            # Шаг 1: договоры
             contracts = _fetch_contracts_for_anno(token, number_anno)
             has_contracts = len(contracts) > 0
             record.has_contracts = has_contracts
-
             if has_contracts:
                 for c in contracts:
                     biin = (c.get("supplierBiin") or "").strip()
@@ -622,38 +623,33 @@ def scrape_announcements(
                         record.winner_bin = biin
                         break
 
-            # ── Шаг 2: файлы объявления — ищем протокол итогов ──────────────
+            # Шаг 2: файлы → протокол
             protocol_soup = None
             if ann_id is not None:
                 files = _fetch_files_for_anno(token, ann_id)
                 protocol_url = None
                 for f in files:
-                    file_name = (f.get("nameRu") or "").lower()
-                    if "протокол итогов" in file_name:
+                    if "протокол итогов" in (f.get("nameRu") or "").lower():
                         protocol_url = f.get("filePath")
                         break
-
                 if protocol_url:
                     logger.info("Скачиваем протокол для объявления id=%s", ann_id)
                     protocol_soup = _download_protocol(token, protocol_url)
 
-            # ── Шаг 3: парсим протокол — победитель и цена ──────────────────
+            # Шаг 3: парсим протокол
             if protocol_soup is not None:
                 tables = protocol_soup.find_all("table")
-
                 proto_name, proto_bin = _find_winner_from_protocol(tables)
                 if proto_name:
                     record.winner_name = proto_name
                 if proto_bin:
                     record.winner_bin = proto_bin
-
-                # Цена только если нет договоров
                 if not has_contracts and record.winner_bin:
                     record.winner_price = _find_winner_price_from_protocol(
                         tables, record.winner_bin
                     )
 
-            # ── Шаг 4: если имя не найдено — пробуем Subjects API ───────────
+            # Шаг 4: имя через Subjects API если не нашли
             if record.winner_bin and not record.winner_name:
                 record.winner_name = _fetch_subject_name(token, record.winner_bin)
 
@@ -687,19 +683,19 @@ if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
-    test_date = sys.argv[1] if len(sys.argv) > 1 else "2026-05-07"
+    date_from = sys.argv[1] if len(sys.argv) > 1 else "2026-04-20"
+    date_to   = sys.argv[2] if len(sys.argv) > 2 else "2026-05-21"
 
     def _progress(current: int, total: int, msg: str) -> None:
         print(f"  [{current}/{total}] {msg}")
 
-    result = scrape_announcements(test_date, on_progress=_progress)
-    print(f"\n=== Объявления за {test_date}: {len(result.records)} найдено ===")
+    result = scrape_announcements(date_from, on_progress=_progress, date_to=date_to)
+    print(f"\n=== Объявления {date_from} — {date_to}: {len(result.records)} найдено ===")
     for rec in result.records[:10]:
         print(
             f"  №{rec.number} | {rec.name[:50]:50s}\n"
             f"           Победитель: {rec.winner_name[:40]}\n"
-            f"           БИН: {rec.winner_bin} | Цена: {rec.winner_price:,.0f} ₸ "
-            f"| Договоры: {rec.has_contracts}\n"
+            f"           БИН: {rec.winner_bin} | Цена: {rec.winner_price:,.0f} ₸\n"
             f"           Ошибка: {rec.error or '—'}\n"
         )
     if result.errors:

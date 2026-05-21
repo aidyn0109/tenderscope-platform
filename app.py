@@ -529,28 +529,41 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
         and not st.session_state.running):
 
     with form_container():
-        st.markdown("#### Поиск объявлений по дате")
+        st.markdown("#### Поиск объявлений по дате протокола итогов")
 
-        selected_date = st.date_input(
-            "Дата окончания приёма заявок:",
-            key="announcement_date_picker",
-        )
+        col_from, col_to = st.columns(2)
+        with col_from:
+            date_from = st.date_input(
+                "Протокол итогов с:",
+                key="announcement_date_from",
+            )
+        with col_to:
+            date_to = st.date_input(
+                "Протокол итогов по:",
+                key="announcement_date_to",
+            )
 
         st.caption(
-            "Применяются фиксированные фильтры: статус «Завершено» и «Формирование протокола итогов», "
+            "Применяются фиксированные фильтры: статус «Итоги опубликованы» и «Договор подписан», "
             "предмет закупки «Работа», сумма закупки от 1 500 000 000 ₸."
         )
 
         st.divider()
 
+        dates_valid = date_from <= date_to
+        if not dates_valid:
+            st.warning("⚠️ Дата 'по' должна быть не раньше даты 'с'")
+
         run_announcements_clicked = st.button(
             "🔍 Запустить анализ",
             use_container_width=True, type="primary",
             key="run_announcements",
+            disabled=not dates_valid,
         )
 
     if run_announcements_clicked:
-        date_str = selected_date.strftime("%Y-%m-%d")
+        date_str = date_from.strftime("%Y-%m-%d")
+        date_to_str = date_to.strftime("%Y-%m-%d")
         st.session_state.selected_date = date_str
 
         tmp_dir = tempfile.mkdtemp(prefix="goszakup_announcements_")
@@ -563,6 +576,7 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
             json.dump({
                 "mode": "announcements",
                 "date": date_str,
+                "date_to": date_to_str,
                 "progress_file": progress_file,
             }, f, ensure_ascii=False)
 
