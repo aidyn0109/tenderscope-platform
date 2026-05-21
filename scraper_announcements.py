@@ -644,7 +644,8 @@ def scrape_announcements(
                     record.winner_name = proto_name
                 if proto_bin:
                     record.winner_bin = proto_bin
-                if not has_contracts and record.winner_bin:
+                # Цену берём из протокола всегда — независимо от наличия договоров
+                if record.winner_bin:
                     record.winner_price = _find_winner_price_from_protocol(
                         tables, record.winner_bin
                     )
