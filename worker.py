@@ -82,6 +82,17 @@ def _ann_to_dict(rec: AnnouncementRecord) -> dict:
         "url":           rec.url,
         "has_contracts": rec.has_contracts,
         "error":         rec.error,
+        "lots":          [
+            {
+                "lot_number":   lot.lot_number,
+                "lot_name":     lot.lot_name,
+                "lot_amount":   lot.lot_amount,
+                "winner_name":  lot.winner_name,
+                "winner_bin":   lot.winner_bin,
+                "winner_price": lot.winner_price,
+            }
+            for lot in (rec.lots or [])
+        ],
     }
 
 

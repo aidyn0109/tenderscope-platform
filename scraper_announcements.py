@@ -36,9 +36,8 @@ MAX_RECORDS = 10_000
 
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
 
-# Статусы: 330=Итоги опубликованы, 350=Договор подписан
 TARGET_STATUS_IDS = [210, 220, 330, 350]
-TARGET_SUBJECT_ID = 2               # 2 = Работа
+TARGET_SUBJECT_ID = 2
 TOTAL_SUM_RANGE = [1_500_000_000, 999_999_999_999]
 
 logger = logging.getLogger(__name__)
@@ -49,6 +48,17 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 @dataclass
+class LotRecord:
+    """Данные по одному лоту внутри объявления."""
+    lot_number: str       # номер лота (например "86606608-ОТ1")
+    lot_name: str         # наименование лота
+    lot_amount: float     # выделенная сумма лота
+    winner_name: str      # наименование победителя
+    winner_bin: str       # БИН победителя
+    winner_price: float   # цена победителя
+
+
+@dataclass
 class AnnouncementRecord:
     number: int
     name: str
@@ -57,12 +67,13 @@ class AnnouncementRecord:
     end_date: str
     sum_amount: float
     status: str
-    winner_name: str
+    winner_name: str      # победитель первого лота (или единственного)
     winner_bin: str
     winner_price: float
     url: str
     has_contracts: bool = False
     error: str = ""
+    lots: list[LotRecord] = field(default_factory=list)  # все лоты
 
 
 @dataclass
@@ -110,6 +121,7 @@ query($filter: TrdBuyFiltersInput, $after: Int) {
     numberAnno
     nameRu
     totalSum
+    countLots
     refBuyStatusId
     startDate
     endDate
@@ -205,6 +217,14 @@ def _to_int(value) -> int | None:
         return None
 
 
+def _clean_number(s: str) -> float:
+    cleaned = (s.replace("\xa0", "")
+                .replace(" ", "")
+                .replace("\u202f", "")
+                .replace(",", "."))
+    return float(cleaned)
+
+
 def _status_name(status_id) -> str:
     sid = _to_int(status_id)
     if sid is None:
@@ -233,8 +253,21 @@ def _method_name(method_id) -> str:
     }.get(mid, f"Способ {mid}")
 
 
+def _is_numbering_row(cells: list[str]) -> bool:
+    if not cells:
+        return False
+    non_empty = [c for c in cells if c.strip()]
+    if not non_empty:
+        return False
+    try:
+        nums = [int(c.strip()) for c in non_empty]
+        return nums == list(range(1, len(nums) + 1))
+    except ValueError:
+        return False
+
+
 # ---------------------------------------------------------------------------
-# Шаг 1 — список объявлений с фильтром по itogiDatePublic
+# Шаг 1 — список объявлений
 # ---------------------------------------------------------------------------
 
 def _fetch_announcements(
@@ -243,11 +276,6 @@ def _fetch_announcements(
     date_to: str,
     errors_sink: list[str],
 ) -> list[dict]:
-    """
-    Тянет объявления по фильтру статус+предмет+сумма,
-    затем фильтрует по itogiDatePublic в Python.
-    date_from, date_to — строки "YYYY-MM-DD".
-    """
     items: list[dict] = []
     after: int | None = None
     filter_input = {
@@ -284,7 +312,6 @@ def _fetch_announcements(
             break
         after = last_id
 
-    # Фильтр по itogiDatePublic (дата публикации итогов) в диапазоне [date_from, date_to]
     filtered = [
         r for r in items
         if r.get("itogiDatePublic")
@@ -298,7 +325,7 @@ def _fetch_announcements(
 
 
 # ---------------------------------------------------------------------------
-# Шаг 2 — договоры по объявлению
+# Шаг 2 — договоры
 # ---------------------------------------------------------------------------
 
 def _fetch_contracts_for_anno(token: str, number_anno: str) -> list[dict]:
@@ -316,7 +343,7 @@ def _fetch_contracts_for_anno(token: str, number_anno: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Шаг 3 — файлы объявления и протокол итогов
+# Шаг 3 — файлы объявления
 # ---------------------------------------------------------------------------
 
 def _fetch_files_for_anno(token: str, ann_id: int) -> list[dict]:
@@ -337,7 +364,6 @@ def _fetch_files_for_anno(token: str, ann_id: int) -> list[dict]:
 
 
 def _download_protocol(token: str, url: str):
-    """Скачивает HTML протокол, возвращает BeautifulSoup или None."""
     if not url:
         return None
     try:
@@ -358,47 +384,152 @@ def _download_protocol(token: str, url: str):
 # Шаг 4 — парсинг HTML протокола
 # ---------------------------------------------------------------------------
 
-def _is_numbering_row(cells: list[str]) -> bool:
-    """Проверяет что строка является нумерацией столбцов '1 | 2 | 3 | ...'"""
-    if not cells:
-        return False
-    non_empty = [c for c in cells if c.strip()]
-    if not non_empty:
-        return False
-    try:
-        nums = [int(c.strip()) for c in non_empty]
-        return nums == list(range(1, len(nums) + 1))
-    except ValueError:
-        return False
+def _get_table_header(table) -> str:
+    """Возвращает объединённый текст первых 3 строк таблицы (нижний регистр)."""
+    rows = table.find_all("tr")
+    return " ".join(
+        rows[i].get_text(" ", strip=True).lower()
+        for i in range(min(3, len(rows)))
+    )
 
 
-def _clean_number(s: str) -> float:
-    """Очищает строку с числом и конвертирует в float."""
-    cleaned = (s.replace("\xa0", "")
-                .replace(" ", "")
-                .replace("\u202f", "")
-                .replace(",", "."))
-    return float(cleaned)
-
-
-def _find_bin_col(rows: list, winner_bin: str) -> int | None:
-    """Находит индекс столбца содержащего БИН победителя."""
-    for row in rows:
+def _parse_price_table(table) -> list[tuple[str, str, float]]:
+    """
+    Парсит таблицу цен. Возвращает список (name, bin, price).
+    Столбцы: № | Наименование | БИН | Выделенная сумма | Цена поставщика | ...
+    """
+    results = []
+    rows = table.find_all("tr")
+    for row in rows[1:]:
         cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if len(cells) < 5:
+            continue
         if _is_numbering_row(cells):
             continue
-        for i, cell in enumerate(cells):
-            if cell.replace(" ", "").strip() == winner_bin:
-                return i
-    return None
+        name = cells[1].strip()
+        bin_val = cells[2].replace(" ", "").strip()
+        if not name or not bin_val:
+            continue
+        try:
+            price = _clean_number(cells[4])
+            if price > 0:
+                results.append((name, bin_val, price))
+        except (ValueError, IndexError):
+            pass
+    return results
+
+
+def _parse_lots_table(table) -> list[tuple[str, str, float]]:
+    """
+    Парсит таблицу списка лотов (русская часть: "№ лота | Наименование лота | ...").
+    Возвращает список (lot_number, lot_name, lot_amount).
+    """
+    lots = []
+    rows = table.find_all("tr")
+    for row in rows[1:]:
+        cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+        if len(cells) < 5:
+            continue
+        if _is_numbering_row(cells):
+            continue
+        lot_num = cells[1].strip()
+        lot_name = cells[2].strip()
+        if not lot_num:
+            continue
+        try:
+            amount = _clean_number(cells[5]) if len(cells) > 5 else _clean_number(cells[4])
+        except (ValueError, IndexError):
+            amount = 0.0
+        lots.append((lot_num, lot_name, amount))
+    return lots
+
+
+def _parse_protocol_lots(tables: list) -> list[LotRecord]:
+    """
+    Разбирает протокол с N лотами.
+
+    Структура протокола:
+    - Таблица "№ лота | Наименование лота" — список всех лотов по порядку
+    - После неё блоки по 8 таблиц на каждый лот, в каждом блоке есть
+      таблица цен ("цена поставщика" или "өнім берушінің бағасы")
+
+    Алгоритм:
+    1. Находим русскую таблицу лотов (заголовок "№ лота | наименование лота")
+    2. Собираем лоты по порядку из этой таблицы
+    3. Ищем все таблицы цен ПОСЛЕ таблицы лотов (по 1 на каждый лот)
+    4. Сопоставляем лоты с таблицами цен по порядку
+    """
+    lot_table_idx = None
+    lots_data: list[tuple[str, str, float]] = []
+
+    # Ищем русскую таблицу лотов (содержит "лота" и "наименование лота")
+    for i, table in enumerate(tables):
+        header = _get_table_header(table)
+        if "лота" in header and "наименование" in header and "количество" in header:
+            candidate = _parse_lots_table(table)
+            if candidate:
+                lot_table_idx = i
+                lots_data = candidate
+                logger.info("Таблица лотов найдена: таблица %d, лотов: %d",
+                            i + 1, len(candidate))
+                break
+
+    if not lots_data:
+        return []
+
+    # Собираем все таблицы цен ПОСЛЕ таблицы лотов
+    price_tables = []
+    for i in range(lot_table_idx + 1, len(tables)):
+        header = _get_table_header(tables[i])
+        if "цена поставщика" in header or "өнім берушінің бағасы" in header:
+            price_tables.append(tables[i])
+
+    logger.info("Таблиц цен найдено: %d для %d лотов", len(price_tables), len(lots_data))
+
+    # Сопоставляем лоты с таблицами цен по порядку
+    lot_records = []
+    for idx, (lot_num, lot_name, lot_amount) in enumerate(lots_data):
+        if idx >= len(price_tables):
+            # Нет таблицы цен для этого лота
+            lot_records.append(LotRecord(
+                lot_number=lot_num,
+                lot_name=lot_name,
+                lot_amount=lot_amount,
+                winner_name="",
+                winner_bin="",
+                winner_price=0.0,
+            ))
+            continue
+
+        prices = _parse_price_table(price_tables[idx])
+        if not prices:
+            lot_records.append(LotRecord(
+                lot_number=lot_num,
+                lot_name=lot_name,
+                lot_amount=lot_amount,
+                winner_name="",
+                winner_bin="",
+                winner_price=0.0,
+            ))
+            continue
+
+        # Победитель — поставщик с наименьшей ценой
+        winner = min(prices, key=lambda x: x[2])
+        lot_records.append(LotRecord(
+            lot_number=lot_num,
+            lot_name=lot_name,
+            lot_amount=lot_amount,
+            winner_name=winner[0],
+            winner_bin=winner[1],
+            winner_price=winner[2],
+        ))
+        logger.info("Лот %s: победитель %s, цена %.2f", lot_num, winner[1], winner[2])
+
+    return lot_records
 
 
 def _find_winner_from_protocol(tables) -> tuple[str, str]:
-    """
-    Ищет победителя в HTML протоколе.
-    Возвращает (winner_name, winner_bin).
-    Таблица победителя содержит 'победител' или 'жеңімпаз' в заголовке.
-    """
+    """Для однолотовых — ищет таблицу победителя."""
     for table in tables:
         rows = table.find_all("tr")
         if len(rows) < 2:
@@ -406,7 +537,6 @@ def _find_winner_from_protocol(tables) -> tuple[str, str]:
         header_text = rows[0].get_text().lower()
         if "победител" not in header_text and "жеңімпаз" not in header_text:
             continue
-
         for row in rows[1:]:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
             if len(cells) < 3:
@@ -417,22 +547,11 @@ def _find_winner_from_protocol(tables) -> tuple[str, str]:
             bin_val = cells[2].replace(" ", "").strip()
             if name and bin_val.isdigit() and len(bin_val) == 12:
                 return name, bin_val
-
     return "", ""
 
 
 def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
-    """
-    Ищет цену победителя в протоколе.
-
-    Тип 1 — обычный конкурс (условные скидки):
-      Заголовок содержит 'цена поставщика' / 'өнім берушінің бағасы'.
-      Цена в столбце bin_col+2.
-
-    Тип 2 — рейтингово-балльная система:
-      Заголовок содержит 'суммарное количество баллов' + 'выделенная сумма'.
-      Цена (выделенная сумма) в столбце bin_col+1.
-    """
+    """Для однолотовых — ищет цену победителя."""
     if not winner_bin:
         return 0.0
 
@@ -448,30 +567,24 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
         if ("цена поставщика" not in header_text
                 and "өнім берушінің бағасы" not in header_text):
             continue
-
-        data_rows = rows[1:]
-        bin_col = _find_bin_col(data_rows, winner_bin)
-        if bin_col is None:
-            continue
-
-        price_col = bin_col + 2
-        for row in data_rows:
+        for row in rows[1:]:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
             if _is_numbering_row(cells):
                 continue
-            if len(cells) <= price_col:
+            if len(cells) < 5:
                 continue
-            bin_val = cells[bin_col].replace(" ", "").strip()
-            if bin_val == winner_bin:
-                try:
-                    price = _clean_number(cells[price_col])
-                    if price > 0:
-                        logger.info("Тип 1: цена победителя %s = %.2f", winner_bin, price)
-                        return price
-                except (ValueError, IndexError):
-                    pass
+            for col_idx, cell in enumerate(cells):
+                if cell.replace(" ", "").strip() == winner_bin:
+                    price_col = col_idx + 2
+                    if price_col < len(cells):
+                        try:
+                            price = _clean_number(cells[price_col])
+                            if price > 0:
+                                return price
+                        except (ValueError, IndexError):
+                            pass
 
-    # Тип 2: рейтингово-балльная система
+    # Тип 2: рейтингово-балльная
     for table in tables:
         rows = table.find_all("tr")
         if len(rows) < 2:
@@ -486,30 +599,20 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
                    or "бөлінген сома" in header_text)
         if not (has_balls and has_sum):
             continue
-
-        data_rows = rows[1:]
-        bin_col = _find_bin_col(data_rows, winner_bin)
-        if bin_col is None:
-            continue
-
-        price_col = bin_col + 1
-        for row in data_rows:
+        for row in rows[1:]:
             cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
             if _is_numbering_row(cells):
                 continue
-            if len(cells) <= price_col:
-                continue
-            bin_val = cells[bin_col].replace(" ", "").strip()
-            if bin_val == winner_bin:
-                try:
-                    price = _clean_number(cells[price_col])
-                    if price > 0:
-                        logger.info("Тип 2: выделенная сумма победителя %s = %.2f",
-                                    winner_bin, price)
-                        return price
-                except (ValueError, IndexError):
-                    pass
-
+            for col_idx, cell in enumerate(cells):
+                if cell.replace(" ", "").strip() == winner_bin:
+                    price_col = col_idx + 1
+                    if price_col < len(cells):
+                        try:
+                            price = _clean_number(cells[price_col])
+                            if price > 0:
+                                return price
+                        except (ValueError, IndexError):
+                            pass
     return 0.0
 
 
@@ -544,14 +647,7 @@ def scrape_announcements(
     on_record: RecordCallback | None = None,
     date_to: str | None = None,
 ) -> ScrapeAnnouncementsResult:
-    """
-    Главная функция парсинга объявлений.
-    selected_date — дата "с" (YYYY-MM-DD), date_to — дата "по" (YYYY-MM-DD).
-    Если date_to не передан — используется selected_date (один день).
-    """
-    # Если date_to не передан — диапазон из одного дня
     effective_date_to = date_to if date_to else selected_date
-
     result = ScrapeAnnouncementsResult(selected_date=selected_date)
 
     try:
@@ -593,6 +689,7 @@ def scrape_announcements(
 
         ann_id = _to_int(item.get("id"))
         number_anno = (item.get("numberAnno") or "").strip()
+        count_lots = _to_int(item.get("countLots")) or 1
         url = ANNOUNCEMENT_URL_TEMPLATE.format(id=ann_id) if ann_id is not None else ""
 
         record = AnnouncementRecord(
@@ -609,6 +706,7 @@ def scrape_announcements(
             url=url,
             has_contracts=False,
             error="",
+            lots=[],
         )
 
         try:
@@ -616,7 +714,7 @@ def scrape_announcements(
             contracts = _fetch_contracts_for_anno(token, number_anno)
             has_contracts = len(contracts) > 0
             record.has_contracts = has_contracts
-            if has_contracts:
+            if has_contracts and contracts:
                 for c in contracts:
                     biin = (c.get("supplierBiin") or "").strip()
                     if biin:
@@ -633,26 +731,52 @@ def scrape_announcements(
                         protocol_url = f.get("filePath")
                         break
                 if protocol_url:
-                    logger.info("Скачиваем протокол для объявления id=%s", ann_id)
+                    logger.info("Скачиваем протокол для объявления id=%s (лотов: %d)",
+                                ann_id, count_lots)
                     protocol_soup = _download_protocol(token, protocol_url)
 
             # Шаг 3: парсим протокол
             if protocol_soup is not None:
                 tables = protocol_soup.find_all("table")
-                proto_name, proto_bin = _find_winner_from_protocol(tables)
-                if proto_name:
-                    record.winner_name = proto_name
-                if proto_bin:
-                    record.winner_bin = proto_bin
-                # Цену берём из протокола всегда — независимо от наличия договоров
-                if record.winner_bin:
-                    record.winner_price = _find_winner_price_from_protocol(
-                        tables, record.winner_bin
-                    )
+
+                if count_lots > 1:
+                    # Многолотовый — парсим каждый лот отдельно
+                    lot_records = _parse_protocol_lots(tables)
+                    record.lots = lot_records
+                    # Заполняем поля первого лота в основную запись
+                    if lot_records:
+                        first = lot_records[0]
+                        record.winner_name = first.winner_name
+                        record.winner_bin = first.winner_bin
+                        record.winner_price = first.winner_price
+                else:
+                    # Однолотовый — старый алгоритм
+                    proto_name, proto_bin = _find_winner_from_protocol(tables)
+                    if proto_name:
+                        record.winner_name = proto_name
+                    if proto_bin:
+                        record.winner_bin = proto_bin
+                    if record.winner_bin:
+                        record.winner_price = _find_winner_price_from_protocol(
+                            tables, record.winner_bin
+                        )
+                    # Создаём один LotRecord для единообразия в Excel
+                    record.lots = [LotRecord(
+                        lot_number="",
+                        lot_name=record.name,
+                        lot_amount=record.sum_amount,
+                        winner_name=record.winner_name,
+                        winner_bin=record.winner_bin,
+                        winner_price=record.winner_price,
+                    )]
 
             # Шаг 4: имя через Subjects API если не нашли
             if record.winner_bin and not record.winner_name:
                 record.winner_name = _fetch_subject_name(token, record.winner_bin)
+                # Обновляем и в лотах
+                for lot in record.lots:
+                    if lot.winner_bin == record.winner_bin and not lot.winner_name:
+                        lot.winner_name = record.winner_name
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка обработки объявления id=%s: %s", ann_id, exc)
@@ -676,10 +800,6 @@ def scrape_announcements(
     return result
 
 
-# ---------------------------------------------------------------------------
-# Быстрый ручной тест
-# ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
@@ -693,11 +813,8 @@ if __name__ == "__main__":
     result = scrape_announcements(date_from, on_progress=_progress, date_to=date_to)
     print(f"\n=== Объявления {date_from} — {date_to}: {len(result.records)} найдено ===")
     for rec in result.records[:10]:
-        print(
-            f"  №{rec.number} | {rec.name[:50]:50s}\n"
-            f"           Победитель: {rec.winner_name[:40]}\n"
-            f"           БИН: {rec.winner_bin} | Цена: {rec.winner_price:,.0f} ₸\n"
-            f"           Ошибка: {rec.error or '—'}\n"
-        )
+        print(f"  №{rec.number} | {rec.name[:50]:50s} | лотов: {len(rec.lots)}")
+        for lot in rec.lots:
+            print(f"    Лот {lot.lot_number}: {lot.winner_name[:30]} | {lot.winner_bin} | {lot.winner_price:,.0f} ₸")
     if result.errors:
         print(f"Всего ошибок: {len(result.errors)}")
