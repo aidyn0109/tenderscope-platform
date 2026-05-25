@@ -543,6 +543,19 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
                 key="announcement_date_to",
             )
 
+        filter_bin = st.text_input(
+            "БИН компании-победителя (необязательно):",
+            key="announcement_filter_bin",
+            placeholder="000000000000 (12 цифр) — оставьте пустым для всех",
+            max_chars=12,
+        ).strip()
+
+        if filter_bin and not re.fullmatch(r"\d{12}", filter_bin):
+            st.caption("⚠️ БИН должен содержать ровно 12 цифр")
+            bin_valid = False
+        else:
+            bin_valid = True
+
         st.caption(
             "Применяются фиксированные фильтры: статус «Итоги опубликованы» и «Договор подписан», "
             "предмет закупки «Работа», сумма закупки от 1 500 000 000 ₸."
@@ -558,7 +571,7 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
             "🔍 Запустить анализ",
             use_container_width=True, type="primary",
             key="run_announcements",
-            disabled=not dates_valid,
+            disabled=not dates_valid or not bin_valid,
         )
 
     if run_announcements_clicked:
@@ -577,6 +590,7 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
                 "mode": "announcements",
                 "date": date_str,
                 "date_to": date_to_str,
+                "filter_bin": filter_bin if filter_bin else None,
                 "progress_file": progress_file,
             }, f, ensure_ascii=False)
 
@@ -742,40 +756,28 @@ if st.session_state.running:
             all_recs = data.get("records", [])
 
             if st.session_state.mode == "announcements":
-                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult, LotRecord
-
-                def _make_ann(r: dict) -> AnnouncementRecord:
-                    lots = [
-                        LotRecord(
-                            lot_number=lt.get("lot_number", ""),
-                            lot_name=lt.get("lot_name", ""),
-                            lot_amount=lt.get("lot_amount", 0.0),
-                            winner_name=lt.get("winner_name", ""),
-                            winner_bin=lt.get("winner_bin", ""),
-                            winner_price=lt.get("winner_price", 0.0),
-                        )
-                        for lt in r.get("lots", [])
-                    ]
-                    return AnnouncementRecord(
-                        number=r.get("number", 0),
-                        name=r.get("name", ""),
-                        method=r.get("method", ""),
-                        start_date=r.get("start_date", ""),
-                        end_date=r.get("end_date", ""),
-                        sum_amount=r.get("sum_amount", 0.0),
-                        status=r.get("status", ""),
-                        winner_name=r.get("winner_name", ""),
-                        winner_bin=r.get("winner_bin", ""),
-                        winner_price=r.get("winner_price", 0.0),
-                        url=r.get("url", ""),
-                        has_contracts=r.get("has_contracts", False),
-                        error=r.get("error", ""),
-                        lots=lots,
-                    )
+                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
 
                 results = ScrapeAnnouncementsResult(
                     selected_date=st.session_state.selected_date,
-                    records=[_make_ann(r) for r in all_recs],
+                    records=[
+                        AnnouncementRecord(
+                            number=r.get("number", 0),
+                            name=r.get("name", ""),
+                            method=r.get("method", ""),
+                            start_date=r.get("start_date", ""),
+                            end_date=r.get("end_date", ""),
+                            sum_amount=r.get("sum_amount", 0.0),
+                            status=r.get("status", ""),
+                            winner_name=r.get("winner_name", ""),
+                            winner_bin=r.get("winner_bin", ""),
+                            winner_price=r.get("winner_price", 0.0),
+                            url=r.get("url", ""),
+                            has_contracts=r.get("has_contracts", False),
+                            error=r.get("error", ""),
+                        )
+                        for r in all_recs
+                    ],
                 )
                 log.info("Загружено %d объявлений", len(all_recs))
 
@@ -840,40 +842,28 @@ if st.session_state.running:
             log.warning("Воркер завершился досрочно. Частичных записей: %d", len(partial))
 
             if st.session_state.mode == "announcements":
-                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult, LotRecord
-
-                def _make_ann_partial(r: dict) -> AnnouncementRecord:
-                    lots = [
-                        LotRecord(
-                            lot_number=lt.get("lot_number", ""),
-                            lot_name=lt.get("lot_name", ""),
-                            lot_amount=lt.get("lot_amount", 0.0),
-                            winner_name=lt.get("winner_name", ""),
-                            winner_bin=lt.get("winner_bin", ""),
-                            winner_price=lt.get("winner_price", 0.0),
-                        )
-                        for lt in r.get("lots", [])
-                    ]
-                    return AnnouncementRecord(
-                        number=r.get("number", 0),
-                        name=r.get("name", ""),
-                        method=r.get("method", ""),
-                        start_date=r.get("start_date", ""),
-                        end_date=r.get("end_date", ""),
-                        sum_amount=r.get("sum_amount", 0.0),
-                        status=r.get("status", ""),
-                        winner_name=r.get("winner_name", ""),
-                        winner_bin=r.get("winner_bin", ""),
-                        winner_price=r.get("winner_price", 0.0),
-                        url=r.get("url", ""),
-                        has_contracts=r.get("has_contracts", False),
-                        error=r.get("error", ""),
-                        lots=lots,
-                    )
+                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
 
                 results = ScrapeAnnouncementsResult(
                     selected_date=st.session_state.selected_date,
-                    records=[_make_ann_partial(r) for r in partial],
+                    records=[
+                        AnnouncementRecord(
+                            number=r.get("number", 0),
+                            name=r.get("name", ""),
+                            method=r.get("method", ""),
+                            start_date=r.get("start_date", ""),
+                            end_date=r.get("end_date", ""),
+                            sum_amount=r.get("sum_amount", 0.0),
+                            status=r.get("status", ""),
+                            winner_name=r.get("winner_name", ""),
+                            winner_bin=r.get("winner_bin", ""),
+                            winner_price=r.get("winner_price", 0.0),
+                            url=r.get("url", ""),
+                            has_contracts=r.get("has_contracts", False),
+                            error=r.get("error", ""),
+                        )
+                        for r in partial
+                    ],
                 )
                 excel_bytes = None
                 try:

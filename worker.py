@@ -82,17 +82,6 @@ def _ann_to_dict(rec: AnnouncementRecord) -> dict:
         "url":           rec.url,
         "has_contracts": rec.has_contracts,
         "error":         rec.error,
-        "lots":          [
-            {
-                "lot_number":   lot.lot_number,
-                "lot_name":     lot.lot_name,
-                "lot_amount":   lot.lot_amount,
-                "winner_name":  lot.winner_name,
-                "winner_bin":   lot.winner_bin,
-                "winner_price": lot.winner_price,
-            }
-            for lot in (rec.lots or [])
-        ],
     }
 
 
@@ -142,7 +131,7 @@ def _run(bins: list[str], progress_file: str, output_file: str) -> tuple[list[di
     return all_records, progress
 
 
-def _run_announcements(date: str, date_to: str, progress_file: str, output_file: str) -> tuple[list[dict], dict]:
+def _run_announcements(date: str, date_to: str, filter_bin: str | None, progress_file: str, output_file: str) -> tuple[list[dict], dict]:
     progress = {
         "announcement_current": 0,
         "announcement_total":   0,
@@ -165,7 +154,7 @@ def _run_announcements(date: str, date_to: str, progress_file: str, output_file:
         _write_output(output_file, all_records)
         log.info("  сохранено %d записей", len(all_records))
 
-    result = scrape_announcements(date, on_progress=on_progress, on_record=on_record, date_to=date_to)
+    result = scrape_announcements(date, on_progress=on_progress, on_record=on_record, date_to=date_to, filter_bin=filter_bin)
 
     return all_records, progress
 
@@ -190,8 +179,9 @@ def main() -> None:
         if mode == "announcements":
             date = params.get("date")
             date_to = params.get("date_to", date)
-            log.info("Парсинг объявлений: %s — %s", date, date_to)
-            records, progress = _run_announcements(date, date_to, progress_file, output_file)
+            filter_bin = params.get("filter_bin")
+            log.info("Парсинг объявлений: %s — %s, БИН фильтр: %s", date, date_to, filter_bin or "нет")
+            records, progress = _run_announcements(date, date_to, filter_bin, progress_file, output_file)
         else:
             # Режим договоров (оригинальный)
             bins = params.get("bins", [])

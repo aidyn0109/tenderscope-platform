@@ -646,8 +646,16 @@ def scrape_announcements(
     on_progress: ProgressCallback | None = None,
     on_record: RecordCallback | None = None,
     date_to: str | None = None,
+    filter_bin: str | None = None,
 ) -> ScrapeAnnouncementsResult:
+    """
+    Главная функция парсинга объявлений.
+    selected_date — дата "с" (YYYY-MM-DD), date_to — дата "по".
+    filter_bin — если задан, в результат попадают только объявления
+                 где победителем (в любом лоте) является компания с этим БИН.
+    """
     effective_date_to = date_to if date_to else selected_date
+    filter_bin = filter_bin.strip() if filter_bin else None
     result = ScrapeAnnouncementsResult(selected_date=selected_date)
 
     try:
@@ -785,6 +793,25 @@ def scrape_announcements(
         if (not record.winner_bin and not record.winner_name
                 and not record.has_contracts and not record.error):
             record.error = "Победитель не найден"
+
+        # Фильтр по БИН — если задан, пропускаем объявления где этот БИН не победил
+        if filter_bin:
+            bin_found = False
+            # Проверяем основной winner_bin
+            if record.winner_bin == filter_bin:
+                bin_found = True
+            # Проверяем по всем лотам
+            if not bin_found:
+                for lot in record.lots:
+                    if lot.winner_bin == filter_bin:
+                        bin_found = True
+                        break
+            if not bin_found:
+                logger.debug(
+                    "Объявление id пропущено — БИН победителя не совпадает с фильтром %s",
+                    filter_bin,
+                )
+                continue  # пропускаем — не добавляем в результат
 
         result.records.append(record)
 
