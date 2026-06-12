@@ -55,15 +55,17 @@ def _write_output(path: str, records: list) -> None:
 
 def _rec_to_dict(rec: ContractRecord) -> dict:
     return {
-        "bin":             rec.bin,
-        "contract_number": rec.contract_number,
-        "description":     rec.description,
-        "validity_period": rec.validity_period,
-        "amount_final":    rec.amount_final,
-        "amount_actual":   rec.amount_actual,
-        "difference":      rec.difference,
-        "url":             rec.url,
-        "error":           rec.error,
+        "bin":                      rec.bin,
+        "contract_number":          rec.contract_number,
+        "description":              rec.description,
+        "validity_period":          rec.validity_period,
+        "amount_final":             rec.amount_final,
+        "amount_actual":            rec.amount_actual,
+        "difference":               rec.difference,
+        "url":                      rec.url,
+        "error":                    rec.error,
+        "specifics_2026_with_vat":    rec.specifics_2026_with_vat,
+        "specifics_2026_without_vat": rec.specifics_2026_without_vat,
     }
 
 
@@ -82,6 +84,18 @@ def _ann_to_dict(rec: AnnouncementRecord) -> dict:
         "url":           rec.url,
         "has_contracts": rec.has_contracts,
         "error":         rec.error,
+        "lots": [
+            {
+                "lot_number":   lot.lot_number,
+                "lot_name":     lot.lot_name,
+                "lot_amount":   lot.lot_amount,
+                "winner_name":  lot.winner_name,
+                "winner_bin":   lot.winner_bin,
+                "winner_price": lot.winner_price,
+                "year1_sum":    lot.year1_sum,
+            }
+            for lot in rec.lots
+        ],
     }
 
 

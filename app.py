@@ -262,6 +262,8 @@ def _records_to_results(records: list[dict]) -> list[ScrapeResult]:
             difference=r.get("difference", 0.0),
             url=r.get("url", ""),
             error=r.get("error", ""),
+            specifics_2026_with_vat=r.get("specifics_2026_with_vat", 0.0),
+            specifics_2026_without_vat=r.get("specifics_2026_without_vat", 0.0),
         )
         by_bin[b].records.append(cr)
         if cr.error:
@@ -756,28 +758,41 @@ if st.session_state.running:
             all_recs = data.get("records", [])
 
             if st.session_state.mode == "announcements":
-                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
+                from scraper_announcements import AnnouncementRecord, LotRecord, ScrapeAnnouncementsResult
+
+                def _deserialize_announcement(r: dict) -> AnnouncementRecord:
+                    lots = [
+                        LotRecord(
+                            lot_number=lot.get("lot_number", ""),
+                            lot_name=lot.get("lot_name", ""),
+                            lot_amount=lot.get("lot_amount", 0.0),
+                            winner_name=lot.get("winner_name", ""),
+                            winner_bin=lot.get("winner_bin", ""),
+                            winner_price=lot.get("winner_price", 0.0),
+                            year1_sum=lot.get("year1_sum", 0.0),
+                        )
+                        for lot in r.get("lots", [])
+                    ]
+                    return AnnouncementRecord(
+                        number=r.get("number", 0),
+                        name=r.get("name", ""),
+                        method=r.get("method", ""),
+                        start_date=r.get("start_date", ""),
+                        end_date=r.get("end_date", ""),
+                        sum_amount=r.get("sum_amount", 0.0),
+                        status=r.get("status", ""),
+                        winner_name=r.get("winner_name", ""),
+                        winner_bin=r.get("winner_bin", ""),
+                        winner_price=r.get("winner_price", 0.0),
+                        url=r.get("url", ""),
+                        has_contracts=r.get("has_contracts", False),
+                        error=r.get("error", ""),
+                        lots=lots,
+                    )
 
                 results = ScrapeAnnouncementsResult(
                     selected_date=st.session_state.selected_date,
-                    records=[
-                        AnnouncementRecord(
-                            number=r.get("number", 0),
-                            name=r.get("name", ""),
-                            method=r.get("method", ""),
-                            start_date=r.get("start_date", ""),
-                            end_date=r.get("end_date", ""),
-                            sum_amount=r.get("sum_amount", 0.0),
-                            status=r.get("status", ""),
-                            winner_name=r.get("winner_name", ""),
-                            winner_bin=r.get("winner_bin", ""),
-                            winner_price=r.get("winner_price", 0.0),
-                            url=r.get("url", ""),
-                            has_contracts=r.get("has_contracts", False),
-                            error=r.get("error", ""),
-                        )
-                        for r in all_recs
-                    ],
+                    records=[_deserialize_announcement(r) for r in all_recs],
                 )
                 log.info("Загружено %d объявлений", len(all_recs))
 
@@ -842,28 +857,41 @@ if st.session_state.running:
             log.warning("Воркер завершился досрочно. Частичных записей: %d", len(partial))
 
             if st.session_state.mode == "announcements":
-                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
+                from scraper_announcements import AnnouncementRecord, LotRecord, ScrapeAnnouncementsResult
+
+                def _deserialize_announcement_partial(r: dict) -> AnnouncementRecord:
+                    lots = [
+                        LotRecord(
+                            lot_number=lot.get("lot_number", ""),
+                            lot_name=lot.get("lot_name", ""),
+                            lot_amount=lot.get("lot_amount", 0.0),
+                            winner_name=lot.get("winner_name", ""),
+                            winner_bin=lot.get("winner_bin", ""),
+                            winner_price=lot.get("winner_price", 0.0),
+                            year1_sum=lot.get("year1_sum", 0.0),
+                        )
+                        for lot in r.get("lots", [])
+                    ]
+                    return AnnouncementRecord(
+                        number=r.get("number", 0),
+                        name=r.get("name", ""),
+                        method=r.get("method", ""),
+                        start_date=r.get("start_date", ""),
+                        end_date=r.get("end_date", ""),
+                        sum_amount=r.get("sum_amount", 0.0),
+                        status=r.get("status", ""),
+                        winner_name=r.get("winner_name", ""),
+                        winner_bin=r.get("winner_bin", ""),
+                        winner_price=r.get("winner_price", 0.0),
+                        url=r.get("url", ""),
+                        has_contracts=r.get("has_contracts", False),
+                        error=r.get("error", ""),
+                        lots=lots,
+                    )
 
                 results = ScrapeAnnouncementsResult(
                     selected_date=st.session_state.selected_date,
-                    records=[
-                        AnnouncementRecord(
-                            number=r.get("number", 0),
-                            name=r.get("name", ""),
-                            method=r.get("method", ""),
-                            start_date=r.get("start_date", ""),
-                            end_date=r.get("end_date", ""),
-                            sum_amount=r.get("sum_amount", 0.0),
-                            status=r.get("status", ""),
-                            winner_name=r.get("winner_name", ""),
-                            winner_bin=r.get("winner_bin", ""),
-                            winner_price=r.get("winner_price", 0.0),
-                            url=r.get("url", ""),
-                            has_contracts=r.get("has_contracts", False),
-                            error=r.get("error", ""),
-                        )
-                        for r in partial
-                    ],
+                    records=[_deserialize_announcement_partial(r) for r in partial],
                 )
                 excel_bytes = None
                 try:

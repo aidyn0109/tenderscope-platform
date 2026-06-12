@@ -4,10 +4,12 @@ scraper_announcements.py — Парсинг закупочных объявле�
 Фильтрация по диапазону дат публикации итогов (itogiDatePublic),
 что соответствует полю "Протокол итогов с/по" на сайте госзакупок.
 Победитель и цена извлекаются из HTML-протокола итогов.
+
 """
 
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -35,6 +37,7 @@ RETRY_DELAY = 3
 MAX_RECORDS = 10_000
 
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
+LOT_PAGE_URL_TEMPLATE = "https://goszakup.gov.kz/ru/lots/index/{lot_id}"
 
 TARGET_STATUS_IDS = [210, 220, 330, 350]
 TARGET_SUBJECT_ID = 2
@@ -56,6 +59,7 @@ class LotRecord:
     winner_name: str      # наименование победителя
     winner_bin: str       # БИН победителя
     winner_price: float   # цена победителя
+    year1_sum: float = 0.0  # сумма 1-го года (из страницы лота)
 
 
 @dataclass
@@ -161,6 +165,16 @@ _SUBJECTS_QUERY = """
 query($filter: TrdBuyFiltersInput) {
   Subjects(limit: 1, filter: $filter) {
     bin
+    nameRu
+  }
+}
+"""
+
+_LOTS_QUERY = """
+query($filter: TrdBuyFiltersInput) {
+  Lots(limit: 100, filter: $filter) {
+    id
+    lotNumber
     nameRu
   }
 }
@@ -393,6 +407,64 @@ def _get_table_header(table) -> str:
     )
 
 
+def _check_failed_purchase(tables) -> bool:
+    """
+    Задача 1.2: Проверяет есть ли в протоколе маркер "Закупка не состоялась".
+    Возвращает True если закупка не состоялась.
+    """
+    markers = [
+        "закупка не состоялась",
+        "мемлекеттік сатып алу өткізілмеді",
+        "закупки не состоялись",
+    ]
+    for table in tables:
+        text = table.get_text(" ", strip=True).lower()
+        for marker in markers:
+            if marker in text:
+                logger.info("Обнаружен маркер 'закупка не состоялась'")
+                return True
+    return False
+
+
+def _find_single_admitted_supplier(tables) -> tuple[str, str]:
+    """
+    Задача 1.1: Fallback для протоколов с одним участником.
+    Ищет таблицу допущенных участников ("допущен" / "жіберілді") и возвращает
+    единственного участника как победителя если он там один.
+    Возвращает (name, bin).
+    """
+    admission_markers = [
+        "допущен",
+        "жіберілді",
+        "к участию допущен",
+        "участники, допущенные",
+        "к участию в конкурсе",
+    ]
+    for table in tables:
+        header = _get_table_header(table)
+        if not any(m in header for m in admission_markers):
+            continue
+        rows = table.find_all("tr")
+        supplier_rows = []
+        for row in rows[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if len(cells) < 3:
+                continue
+            if _is_numbering_row(cells):
+                continue
+            name = cells[1].strip() if len(cells) > 1 else ""
+            bin_val = cells[2].replace(" ", "").strip() if len(cells) > 2 else ""
+            if name and bin_val and bin_val.isdigit() and len(bin_val) == 12:
+                supplier_rows.append((name, bin_val))
+        if len(supplier_rows) == 1:
+            logger.info(
+                "Единственный допущенный участник (fallback): %s / %s",
+                supplier_rows[0][0], supplier_rows[0][1],
+            )
+            return supplier_rows[0]
+    return "", ""
+
+
 def _parse_price_table(table) -> list[tuple[str, str, float]]:
     """
     Парсит таблицу цен. Возвращает список (name, bin, price).
@@ -462,7 +534,6 @@ def _parse_protocol_lots(tables: list) -> list[LotRecord]:
     lot_table_idx = None
     lots_data: list[tuple[str, str, float]] = []
 
-    # Ищем русскую таблицу лотов (содержит "лота" и "наименование лота")
     for i, table in enumerate(tables):
         header = _get_table_header(table)
         if "лота" in header and "наименование" in header and "количество" in header:
@@ -477,7 +548,6 @@ def _parse_protocol_lots(tables: list) -> list[LotRecord]:
     if not lots_data:
         return []
 
-    # Собираем все таблицы цен ПОСЛЕ таблицы лотов
     price_tables = []
     for i in range(lot_table_idx + 1, len(tables)):
         header = _get_table_header(tables[i])
@@ -486,11 +556,9 @@ def _parse_protocol_lots(tables: list) -> list[LotRecord]:
 
     logger.info("Таблиц цен найдено: %d для %d лотов", len(price_tables), len(lots_data))
 
-    # Сопоставляем лоты с таблицами цен по порядку
     lot_records = []
     for idx, (lot_num, lot_name, lot_amount) in enumerate(lots_data):
         if idx >= len(price_tables):
-            # Нет таблицы цен для этого лота
             lot_records.append(LotRecord(
                 lot_number=lot_num,
                 lot_name=lot_name,
@@ -513,7 +581,6 @@ def _parse_protocol_lots(tables: list) -> list[LotRecord]:
             ))
             continue
 
-        # Победитель — поставщик с наименьшей ценой
         winner = min(prices, key=lambda x: x[2])
         lot_records.append(LotRecord(
             lot_number=lot_num,
@@ -613,6 +680,37 @@ def _find_winner_price_from_protocol(tables, winner_bin: str) -> float:
                                 return price
                         except (ValueError, IndexError):
                             pass
+
+    # Тип 3: единственный участник — берём выделенную сумму из таблицы лота
+    for table in tables:
+        rows = table.find_all("tr")
+        if len(rows) < 2:
+            continue
+        header_text = " ".join(
+            rows[i].get_text(" ", strip=True).lower()
+            for i in range(min(3, len(rows)))
+        )
+        has_sum = ("выделенная сумма" in header_text or "бөлінген сома" in header_text)
+        if not has_sum:
+            continue
+        for row in rows[1:]:
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            if _is_numbering_row(cells):
+                continue
+            for col_idx, cell in enumerate(cells):
+                if cell.replace(" ", "").strip() == winner_bin:
+                    price_col = col_idx + 1
+                    if price_col < len(cells):
+                        try:
+                            price = _clean_number(cells[price_col])
+                            if price > 0:
+                                logger.info(
+                                    "Тип 3 (выделенная сумма) для БИН %s: %.2f",
+                                    winner_bin, price,
+                                )
+                                return price
+                        except (ValueError, IndexError):
+                            pass
     return 0.0
 
 
@@ -635,6 +733,111 @@ def _fetch_subject_name(token: str, winner_bin: str) -> str:
     if not subjects:
         return ""
     return (subjects[0].get("nameRu") or "").strip()
+
+
+# ---------------------------------------------------------------------------
+# Задача 2 — Сумма 1-го года (year1_sum)
+# ---------------------------------------------------------------------------
+
+def _fetch_lots_for_anno(token: str, ann_id: int) -> list[dict]:
+    """
+    Запрашивает лоты объявления через GraphQL.
+    Возвращает список dict: {id, lotNumber, nameRu}.
+    """
+    if not ann_id:
+        return []
+    try:
+        resp = _graphql_request(
+            token, _LOTS_QUERY,
+            {"filter": {"trdBuyId": ann_id}},
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Lots(trdBuyId=%s) ошибка: %s", ann_id, exc)
+        return []
+    return (resp.get("data") or {}).get("Lots") or []
+
+
+def _fetch_year1_sum(token: str, lot_id: int) -> float:
+    """
+    Загружает страницу лота goszakup.gov.kz/ru/lots/index/{lot_id}
+    и извлекает поле "Сумма 1 год" из таблицы.
+    Возвращает 0.0 если поле не найдено или произошла ошибка.
+    """
+    if not lot_id:
+        return 0.0
+    url = LOT_PAGE_URL_TEMPLATE.format(lot_id=lot_id)
+    try:
+        r = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            verify=False,
+            timeout=PROTOCOL_TIMEOUT,
+        )
+        r.raise_for_status()
+        soup = BeautifulSoup(r.content, "html.parser")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка загрузки страницы лота id=%s: %s", lot_id, exc)
+        return 0.0
+
+    # Ищем строку с "Сумма 1 год" / "1 жыл сомасы" в таблицах страницы
+    year1_labels = ["сумма 1 год", "1 жыл сомасы", "сумма на 1 год"]
+    for table in soup.find_all("table"):
+        for row in table.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in row.find_all(["td", "th"])]
+            for i, cell in enumerate(cells):
+                if cell.lower().strip() in year1_labels and i + 1 < len(cells):
+                    try:
+                        value = _clean_number(cells[i + 1])
+                        if value > 0:
+                            logger.info("year1_sum для lot_id=%s: %.2f", lot_id, value)
+                            return value
+                    except (ValueError, IndexError):
+                        pass
+
+    # Также ищем в dl/dt-dd структурах
+    for dt in soup.find_all("dt"):
+        dt_text = dt.get_text(strip=True).lower()
+        if any(label in dt_text for label in year1_labels):
+            dd = dt.find_next_sibling("dd")
+            if dd:
+                try:
+                    value = _clean_number(dd.get_text(strip=True))
+                    if value > 0:
+                        logger.info("year1_sum (dl) для lot_id=%s: %.2f", lot_id, value)
+                        return value
+                except (ValueError, IndexError):
+                    pass
+
+    # Ищем в тексте страницы с regex
+    page_text = soup.get_text(" ")
+    patterns = [
+        r"[Сс]умма\s+1\s+год[а]?\s*[:\—\-]?\s*([\d\s\u00a0\u202f,.]+)",
+        r"1\s+жыл\s+сомасы\s*[:\—\-]?\s*([\d\s\u00a0\u202f,.]+)",
+    ]
+    for pattern in patterns:
+        m = re.search(pattern, page_text)
+        if m:
+            try:
+                value = _clean_number(m.group(1).strip().split()[0])
+                if value > 0:
+                    logger.info("year1_sum (regex) для lot_id=%s: %.2f", lot_id, value)
+                    return value
+            except (ValueError, IndexError):
+                pass
+
+    logger.debug("year1_sum не найдена для lot_id=%s", lot_id)
+    return 0.0
+
+
+def _build_lot_number_to_id_map(lots_api: list[dict]) -> dict[str, int]:
+    """Строит маппинг lotNumber → lot_id из ответа API лотов."""
+    result = {}
+    for lot in lots_api:
+        lot_id = _to_int(lot.get("id"))
+        lot_number = (lot.get("lotNumber") or "").strip()
+        if lot_id and lot_number:
+            result[lot_number] = lot_id
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -747,28 +950,45 @@ def scrape_announcements(
             if protocol_soup is not None:
                 tables = protocol_soup.find_all("table")
 
-                if count_lots > 1:
+                # Задача 1.2: проверяем не состоялась ли закупка
+                if _check_failed_purchase(tables):
+                    record.winner_name = "Закупка не состоялась"
+                    record.lots = [LotRecord(
+                        lot_number="",
+                        lot_name=record.name,
+                        lot_amount=record.sum_amount,
+                        winner_name="Закупка не состоялась",
+                        winner_bin="",
+                        winner_price=0.0,
+                    )]
+                elif count_lots > 1:
                     # Многолотовый — парсим каждый лот отдельно
                     lot_records = _parse_protocol_lots(tables)
                     record.lots = lot_records
-                    # Заполняем поля первого лота в основную запись
                     if lot_records:
                         first = lot_records[0]
                         record.winner_name = first.winner_name
                         record.winner_bin = first.winner_bin
                         record.winner_price = first.winner_price
                 else:
-                    # Однолотовый — старый алгоритм
+                    # Однолотовый — стандартный алгоритм
                     proto_name, proto_bin = _find_winner_from_protocol(tables)
                     if proto_name:
                         record.winner_name = proto_name
                     if proto_bin:
                         record.winner_bin = proto_bin
+
+                    # Задача 1.1: fallback — единственный допущенный участник
+                    if not record.winner_bin:
+                        fallback_name, fallback_bin = _find_single_admitted_supplier(tables)
+                        if fallback_bin:
+                            record.winner_name = fallback_name
+                            record.winner_bin = fallback_bin
+
                     if record.winner_bin:
                         record.winner_price = _find_winner_price_from_protocol(
                             tables, record.winner_bin
                         )
-                    # Создаём один LotRecord для единообразия в Excel
                     record.lots = [LotRecord(
                         lot_number="",
                         lot_name=record.name,
@@ -781,26 +1001,39 @@ def scrape_announcements(
             # Шаг 4: имя через Subjects API если не нашли
             if record.winner_bin and not record.winner_name:
                 record.winner_name = _fetch_subject_name(token, record.winner_bin)
-                # Обновляем и в лотах
                 for lot in record.lots:
                     if lot.winner_bin == record.winner_bin and not lot.winner_name:
                         lot.winner_name = record.winner_name
+
+            # Задача 2: year1_sum — суммы 1-го года для каждого лота
+            if ann_id is not None and record.lots:
+                lots_api = _fetch_lots_for_anno(token, ann_id)
+                if lots_api:
+                    lot_num_to_id = _build_lot_number_to_id_map(lots_api)
+                    for lot in record.lots:
+                        lot_id = None
+                        if lot.lot_number:
+                            lot_id = lot_num_to_id.get(lot.lot_number)
+                        elif len(lots_api) == 1:
+                            # Однолотовое объявление — берём единственный лот
+                            lot_id = _to_int(lots_api[0].get("id"))
+                        if lot_id:
+                            lot.year1_sum = _fetch_year1_sum(token, lot_id)
 
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка обработки объявления id=%s: %s", ann_id, exc)
             record.error = f"Ошибка: {exc}"
 
         if (not record.winner_bin and not record.winner_name
-                and not record.has_contracts and not record.error):
+                and not record.has_contracts and not record.error
+                and record.winner_name != "Закупка не состоялась"):
             record.error = "Победитель не найден"
 
-        # Фильтр по БИН — если задан, пропускаем объявления где этот БИН не победил
+        # Фильтр по БИН
         if filter_bin:
             bin_found = False
-            # Проверяем основной winner_bin
             if record.winner_bin == filter_bin:
                 bin_found = True
-            # Проверяем по всем лотам
             if not bin_found:
                 for lot in record.lots:
                     if lot.winner_bin == filter_bin:
@@ -808,10 +1041,10 @@ def scrape_announcements(
                         break
             if not bin_found:
                 logger.debug(
-                    "Объявление id пропущено — БИН победителя не совпадает с фильтром %s",
+                    "Объявление пропущено — БИН победителя не совпадает с фильтром %s",
                     filter_bin,
                 )
-                continue  # пропускаем — не добавляем в результат
+                continue
 
         result.records.append(record)
 
@@ -842,6 +1075,10 @@ if __name__ == "__main__":
     for rec in result.records[:10]:
         print(f"  №{rec.number} | {rec.name[:50]:50s} | лотов: {len(rec.lots)}")
         for lot in rec.lots:
-            print(f"    Лот {lot.lot_number}: {lot.winner_name[:30]} | {lot.winner_bin} | {lot.winner_price:,.0f} ₸")
+            print(
+                f"    Лот {lot.lot_number}: {lot.winner_name[:30]} | "
+                f"{lot.winner_bin} | {lot.winner_price:,.0f} ₸ | "
+                f"year1: {lot.year1_sum:,.0f} ₸"
+            )
     if result.errors:
         print(f"Всего ошибок: {len(result.errors)}")

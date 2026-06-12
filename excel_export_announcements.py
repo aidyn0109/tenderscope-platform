@@ -1,6 +1,7 @@
 """
 excel_export_announcements.py — Формирование Excel-отчёта по результатам парсинга объявлений.
 Каждый лот объявления выводится отдельной строкой.
+
 """
 
 import io
@@ -40,9 +41,10 @@ COL_HEADERS = [
     "Наименование победителя конкурса",     # J
     "БИН победителя",                       # K
     "Цена победителя, тг.",                 # L
-    "Гиперссылка на объявление",            # M
+    "Сумма 1 год, тг.",                     # M  ← новый столбец
+    "Гиперссылка на объявление",            # N
 ]
-COL_WIDTHS = [6, 45, 20, 22, 22, 20, 22, 18, 40, 35, 16, 20, 50]
+COL_WIDTHS = [6, 45, 20, 22, 22, 20, 22, 18, 40, 35, 16, 20, 20, 50]
 
 
 def _apply_header_style(cell, text: str) -> None:
@@ -85,6 +87,7 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
     row_idx = 2
     total_price = 0.0
     total_sum = 0.0
+    total_year1 = 0.0
 
     for record in result.records:
         lots = record.lots
@@ -97,6 +100,7 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
                                     winner_name=record.winner_name,
                                     winner_bin=record.winner_bin,
                                     winner_price=record.winner_price,
+                                    year1_sum=0.0,
                                     is_first_lot=True)
             if record.winner_price > 0:
                 total_price += record.winner_price
@@ -116,11 +120,14 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
                 winner_name=lot.winner_name,
                 winner_bin=lot.winner_bin,
                 winner_price=lot.winner_price,
+                year1_sum=lot.year1_sum,
                 is_first_lot=is_first,
                 fill=None if is_first else LOT_FILL,
             )
             if lot.winner_price > 0:
                 total_price += lot.winner_price
+            if lot.year1_sum > 0:
+                total_year1 += lot.year1_sum
             row_idx += 1
 
         # Суммируем сумму объявления один раз
@@ -149,6 +156,12 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
     cell_price.number_format = NUMBER_FORMAT
     cell_price.alignment = Alignment(horizontal="right", vertical="center")
 
+    cell_year1 = ws.cell(row=row_idx, column=13)
+    cell_year1.value = total_year1 if total_year1 > 0 else ""
+    if total_year1 > 0:
+        cell_year1.number_format = NUMBER_FORMAT
+        cell_year1.alignment = Alignment(horizontal="right", vertical="center")
+
     ws.freeze_panes = "A2"
 
 
@@ -161,6 +174,7 @@ def _write_announcement_row(
     winner_name: str,
     winner_bin: str,
     winner_price: float,
+    year1_sum: float,
     is_first_lot: bool = True,
     fill=None,
 ) -> None:
@@ -229,18 +243,25 @@ def _write_announcement_row(
     else:
         _apply_cell_style(cell_l, "—", fill=fill)
 
-    # M — Гиперссылка (только в первой строке)
+    # M — Сумма 1 год
     cell_m = ws.cell(row=row_idx, column=13)
-    if is_first_lot and record.url:
-        cell_m.value = record.url
-        cell_m.hyperlink = record.url
-        cell_m.font = LINK_FONT
-        cell_m.border = THIN_BORDER
-        cell_m.alignment = Alignment(vertical="top", wrap_text=False)
-        if fill:
-            cell_m.fill = fill
+    if year1_sum > 0:
+        _apply_cell_style(cell_m, year1_sum, is_number=True, fill=fill)
     else:
-        _apply_cell_style(cell_m, "", fill=fill)
+        _apply_cell_style(cell_m, "—", fill=fill)
+
+    # N — Гиперссылка (только в первой строке)
+    cell_n = ws.cell(row=row_idx, column=14)
+    if is_first_lot and record.url:
+        cell_n.value = record.url
+        cell_n.hyperlink = record.url
+        cell_n.font = LINK_FONT
+        cell_n.border = THIN_BORDER
+        cell_n.alignment = Alignment(vertical="top", wrap_text=False)
+        if fill:
+            cell_n.fill = fill
+    else:
+        _apply_cell_style(cell_n, "", fill=fill)
 
 
 def build_excel_announcements_report(result: ScrapeAnnouncementsResult) -> bytes:
