@@ -251,19 +251,19 @@ def _records_to_results(records: list[dict]) -> list[ScrapeResult]:
     for r in records:
         b = r["bin"]
         if b not in by_bin:
-            by_bin[b] = ScrapeResult(bin=b)
+            by_bin[b] = ScrapeResult(bin=b, max_income=r.get("max_income", 0.0))
         cr = ContractRecord(
             bin=r["bin"],
+            supplier_name=r.get("supplier_name", ""),
             contract_number=r.get("contract_number", ""),
             description=r.get("description", ""),
-            validity_period=r.get("validity_period", ""),
-            amount_final=r.get("amount_final", 0.0),
+            cr_datetime=r.get("cr_datetime", ""),
+            amount_planned=r.get("amount_planned", 0.0),
             amount_actual=r.get("amount_actual", 0.0),
-            difference=r.get("difference", 0.0),
+            amount_total=r.get("amount_total", 0.0),
+            max_income=r.get("max_income", 0.0),
             url=r.get("url", ""),
             error=r.get("error", ""),
-            specifics_2026_with_vat=r.get("specifics_2026_with_vat", 0.0),
-            specifics_2026_without_vat=r.get("specifics_2026_without_vat", 0.0),
         )
         by_bin[b].records.append(cr)
         if cr.error:
@@ -633,9 +633,11 @@ if (st.session_state.page == PAGE_CONTRACTS
         st.markdown("#### Введите БИН компаний-поставщиков")
 
         bin_list = st.session_state.bin_list
+        max_income_list = st.session_state.get("max_income_list", ["0"] * len(bin_list))
+
         for i in range(len(bin_list)):
-            col_in, col_rm = st.columns([5, 1])
-            with col_in:
+            col_bin, col_income, col_rm = st.columns([4, 3, 1])
+            with col_bin:
                 val = st.text_input(
                     f"БИН {i+1}", value=bin_list[i], key=f"bin_{i}",
                     placeholder="000000000000 (12 цифр)", max_chars=12,
@@ -644,23 +646,52 @@ if (st.session_state.page == PAGE_CONTRACTS
                 bin_list[i] = val.strip()
                 if val.strip() and not validate_bin(val):
                     st.caption("⚠️ БИН должен содержать ровно 12 цифр")
+            with col_income:
+                inc_val = st.text_input(
+                    f"Макс. доход {i+1}", value=max_income_list[i] if i < len(max_income_list) else "0",
+                    key=f"max_income_{i}",
+                    placeholder="Макс. доход (тг)",
+                    label_visibility="collapsed",
+                )
+                if i < len(max_income_list):
+                    max_income_list[i] = inc_val.strip()
+                else:
+                    max_income_list.append(inc_val.strip())
             with col_rm:
                 if len(bin_list) > 1:
                     if st.button("✕", key=f"rm_{i}"):
-                        bin_list.pop(i); st.rerun()
+                        bin_list.pop(i)
+                        if i < len(max_income_list):
+                            max_income_list.pop(i)
+                        st.rerun()
                 else:
                     st.write("")
 
         col_add, _ = st.columns([2, 5])
         with col_add:
             if st.button("＋ Добавить БИН", use_container_width=True):
-                bin_list.append(""); st.rerun()
+                bin_list.append("")
+                max_income_list.append("0")
+                st.rerun()
 
         st.session_state.bin_list = bin_list
+        st.session_state.max_income_list = max_income_list
         st.divider()
 
         filled = [b for b in bin_list if b.strip()]
-        ok     = bool(filled) and all(validate_bin(b) for b in filled)
+        bin_ok = bool(filled) and all(validate_bin(b) for b in filled)
+        # Проверяем что для каждого заполненного БИН есть макс. доход (число)
+        income_ok = True
+        for idx, b in enumerate(bin_list):
+            if b.strip():
+                inc = max_income_list[idx] if idx < len(max_income_list) else "0"
+                try:
+                    v = float(inc.strip()) if inc.strip() else 0.0
+                    if v <= 0:
+                        income_ok = False
+                except ValueError:
+                    income_ok = False
+        ok = bin_ok and income_ok
 
         run_contracts_clicked = st.button(
             "🔍 Запустить анализ", disabled=not ok, type="primary",
@@ -674,8 +705,18 @@ if (st.session_state.page == PAGE_CONTRACTS
         progress_file = os.path.join(tmp_dir, "progress.json")
         log_file_path = os.path.join(tmp_dir, "worker.log")
 
+        # Формируем список {bin, max_income}
+        bin_data = []
+        for idx, b in enumerate(filled):
+            inc = max_income_list[idx] if idx < len(max_income_list) else "0"
+            try:
+                max_inc = float(inc.strip())
+            except ValueError:
+                max_inc = 0.0
+            bin_data.append({"bin": b, "max_income": max_inc})
+
         with open(input_file, "w", encoding="utf-8") as f:
-            json.dump({"bins": filled, "progress_file": progress_file}, f, ensure_ascii=False)
+            json.dump({"bins": bin_data, "progress_file": progress_file}, f, ensure_ascii=False)
 
         log_file = open(log_file_path, "w", encoding="utf-8")
         popen_kwargs: dict = {"stdout": log_file, "stderr": sys.stderr}
@@ -971,46 +1012,50 @@ if st.session_state.results is not None and not st.session_state.running:
 
         total_contracts = sum(len(r.records) for r in results)
         total_errors    = sum(len(r.errors)  for r in results)
-        grand_diff      = sum(
-            rec.difference for r in results for rec in r.records
-            if not rec.error or rec.error == "Сумма не найдена"
+        grand_total     = sum(
+            rec.amount_total for r in results for rec in r.records
+            if not rec.error
         )
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Всего договоров",   total_contracts)
         c2.metric("Ошибок при сборе",  total_errors)
-        c3.metric("Суммарная разница", f"{grand_diff:,.0f} ₸")
+        c3.metric("Общая итоговая сумма", f"{grand_total:,.0f} ₸")
         st.divider()
 
         for result in results:
-            valid = [r for r in result.records if not r.error or r.error == "Сумма не найдена"]
-            bin_diff  = sum(rec.difference for rec in valid)
+            valid = [r for r in result.records if not r.error]
+            bin_total = sum(rec.amount_total for rec in valid)
             err_count = sum(
                 1 for rec in result.records
-                if rec.error and rec.error != "Сумма не найдена"
+                if rec.error
             )
+            # Результат загрузки для этого БИН
+            load_ratio = bin_total / result.max_income if result.max_income > 0 else 0.0
+            supplier_name = result.records[0].supplier_name if result.records else ""
             with st.expander(
-                f"БИН {result.bin} — {len(result.records)} договоров | разница: {bin_diff:,.0f} ₸",
+                f"БИН {result.bin} | {supplier_name} — {len(result.records)} договоров | "
+                f"Итого: {bin_total:,.0f} ₸ | Загрузка: {load_ratio:.2f}",
                 expanded=True,
             ):
                 if err_count:
                     st.warning(f"⚠️ Ошибок при загрузке: {err_count}")
                     with st.expander("Подробности ошибок"):
                         for rec in result.records:
-                            if rec.error and rec.error != "Сумма не найдена":
+                            if rec.error:
                                 url_short = rec.url[-70:] if rec.url else "—"
                                 st.caption(f"🔗 `{url_short}`  \n❌ {rec.error}")
                 for rec in result.records[:10]:
-                    has_error = rec.error and rec.error != "Сумма не найдена"
+                    has_error = bool(rec.error)
                     icon      = "⚠️" if has_error else "📄"
-                    diff_str  = f"{rec.difference:,.0f} ₸" if not has_error else "—"
+                    total_str = f"{rec.amount_total:,.0f} ₸" if not has_error else "—"
                     num_part  = f" №{rec.contract_number}" if rec.contract_number else ""
                     st.markdown(
                         f"{icon} **{rec.description[:80]}**{num_part}  \n"
-                        f"Срок: `{rec.validity_period or '—'}` | "
-                        f"Итог: `{rec.amount_final:,.0f} ₸` | "
+                        f"Дата создания: `{rec.cr_datetime or '—'}` | "
+                        f"План: `{rec.amount_planned:,.0f} ₸` | "
                         f"Факт: `{rec.amount_actual:,.0f} ₸` | "
-                        f"Разница: `{diff_str}`"
+                        f"Итого: `{total_str}`"
                         + (f"  — [{rec.url}]({rec.url})" if rec.url else "")
                     )
                 if len(result.records) > 10:

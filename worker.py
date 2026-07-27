@@ -5,7 +5,7 @@ worker.py — Автономный процесс парсинга.
     python worker.py <json_input_file> <json_output_file>
 
 Обмен данными через временные JSON-файлы:
-  input:  {"bins": ["БИН1", "БИН2"], "progress_file": "path/to/prog.json"}  # режим договоров
+  input:  {"bins": [{"bin": "БИН1", "max_income": 500000000.0}, ...], "progress_file": "path/to/prog.json"}  # режим договоров
           {"mode": "announcements", "date": "YYYY-MM-DD", "progress_file": "path/to/prog.json"}  # режим объявлений
   output: {"records": [...], "error": null}
 
@@ -55,17 +55,17 @@ def _write_output(path: str, records: list) -> None:
 
 def _rec_to_dict(rec: ContractRecord) -> dict:
     return {
-        "bin":                      rec.bin,
-        "contract_number":          rec.contract_number,
-        "description":              rec.description,
-        "validity_period":          rec.validity_period,
-        "amount_final":             rec.amount_final,
-        "amount_actual":            rec.amount_actual,
-        "difference":               rec.difference,
-        "url":                      rec.url,
-        "error":                    rec.error,
-        "specifics_2026_with_vat":    rec.specifics_2026_with_vat,
-        "specifics_2026_without_vat": rec.specifics_2026_without_vat,
+        "bin":                 rec.bin,
+        "supplier_name":       rec.supplier_name,
+        "contract_number":     rec.contract_number,
+        "description":         rec.description,
+        "cr_datetime":         rec.cr_datetime,
+        "amount_planned":      rec.amount_planned,
+        "amount_actual":       rec.amount_actual,
+        "amount_total":        rec.amount_total,
+        "max_income":          rec.max_income,
+        "url":                 rec.url,
+        "error":               rec.error,
     }
 
 
@@ -99,20 +99,22 @@ def _ann_to_dict(rec: AnnouncementRecord) -> dict:
     }
 
 
-def _run(bins: list[str], progress_file: str, output_file: str) -> tuple[list[dict], dict]:
+def _run(bin_data: list[dict], progress_file: str, output_file: str) -> tuple[list[dict], dict]:
+    """
+    bin_data: список словарей вида {"bin": "031240001439", "max_income": 500000000.0}
+    """
     progress = {
         "bin_current":     0,
-        "bin_total":       len(bins),
+        "bin_total":       len(bin_data),
         "bin_name":        "",
         "contract_current": 0,
         "contract_total":  0,
-        "message":         "Запуск браузера...",
+        "message":         "Запуск сбора данных...",
         "done":            False,
     }
     _write_progress(progress_file, progress)
 
     all_records: list[dict] = []
-    # Сразу создаём пустой output — app.py может читать в любой момент
     _write_output(output_file, all_records)
 
     def on_bin_start(cur: int, tot: int, name: str) -> None:
@@ -136,7 +138,7 @@ def _run(bins: list[str], progress_file: str, output_file: str) -> tuple[list[di
         log.info("  сохранено %d записей", len(all_records))
 
     scrape_all(
-        bins,
+        bin_data,
         on_bin_start=on_bin_start,
         on_contract_progress=on_contract,
         on_record=on_record,
@@ -149,7 +151,7 @@ def _run_announcements(date: str, date_to: str, filter_bin: str | None, progress
     progress = {
         "announcement_current": 0,
         "announcement_total":   0,
-        "message":              "Запуск браузера...",
+        "message":              "Запуск сбора данных...",
         "done":                 False,
     }
     _write_progress(progress_file, progress)
@@ -197,10 +199,14 @@ def main() -> None:
             log.info("Парсинг объявлений: %s — %s, БИН фильтр: %s", date, date_to, filter_bin or "нет")
             records, progress = _run_announcements(date, date_to, filter_bin, progress_file, output_file)
         else:
-            # Режим договоров (оригинальный)
-            bins = params.get("bins", [])
-            log.info("Парсинг договоров для БИН: %s", bins)
-            records, progress = _run(bins, progress_file, output_file)
+            # Режим договоров — bins теперь список словарей [{bin, max_income}, ...]
+            bin_data = params.get("bins", [])
+            # Совместимость: если старый формат (список строк), конвертируем
+            if bin_data and isinstance(bin_data[0], str):
+                bin_data = [{"bin": b, "max_income": 0.0} for b in bin_data]
+            bin_names = [b["bin"] for b in bin_data]
+            log.info("Парсинг договоров для БИН: %s", bin_names)
+            records, progress = _run(bin_data, progress_file, output_file)
 
         # Финальная запись — фиксируем итоговый список (on_record уже писал частично)
         _write_output(output_file, records)
