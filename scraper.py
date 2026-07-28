@@ -128,8 +128,8 @@ query($f: ContractFiltersInput, $after: Int) {
     fin_year
     contract_units {
       id
-      total_sum_wnds
-      fact_sum_wnds
+      total_sum
+      fact_sum
     }
   }
 }
@@ -337,10 +337,10 @@ def scrape_bin(
         description = (item.get("description_ru") or "").strip() or "(описание отсутствует)"
         contract_number = (item.get("contract_number_sys") or "").strip()
 
-        # Суммы по предметам договора (contract_units) — используем wnds (без НДС)
+        # Суммы по предметам договора (contract_units) — без НДС
         units = item.get("contract_units") or []
-        amount_planned = _sum_units(units, "total_sum_wnds")    # Сумма 1: без НДС
-        amount_actual = _sum_units(units, "fact_sum_wnds")       # Сумма 2: без НДС
+        amount_planned = _sum_units(units, "total_sum")    # Сумма 1: без НДС
+        amount_actual = _sum_units(units, "fact_sum")       # Сумма 2: без НДС
         amount_total = round(amount_planned - amount_actual, 2)
 
         url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
