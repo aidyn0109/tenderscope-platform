@@ -128,7 +128,7 @@ query($f: ContractFiltersInput, $after: Int) {
     fin_year
     contract_units {
       id
-      total_sum
+      item_price
       fact_sum
     }
   }
@@ -339,7 +339,7 @@ def scrape_bin(
 
         # Суммы по предметам договора (contract_units) — без НДС
         units = item.get("contract_units") or []
-        amount_planned = _sum_units(units, "total_sum")    # Сумма 1: без НДС
+        amount_planned = _sum_units(units, "item_price")    # Сумма 1: без НДС
         amount_actual = _sum_units(units, "fact_sum")       # Сумма 2: без НДС
         amount_total = round(amount_planned - amount_actual, 2)
 
