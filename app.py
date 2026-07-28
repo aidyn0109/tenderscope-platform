@@ -545,22 +545,9 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
                 key="announcement_date_to",
             )
 
-        filter_bin = st.text_input(
-            "БИН компании-победителя (необязательно):",
-            key="announcement_filter_bin",
-            placeholder="000000000000 (12 цифр) — оставьте пустым для всех",
-            max_chars=12,
-        ).strip()
-
-        if filter_bin and not re.fullmatch(r"\d{12}", filter_bin):
-            st.caption("⚠️ БИН должен содержать ровно 12 цифр")
-            bin_valid = False
-        else:
-            bin_valid = True
-
         st.caption(
-            "Применяются фиксированные фильтры: статус «Итоги опубликованы» и «Договор подписан», "
-            "предмет закупки «Работа», сумма закупки от 1 500 000 000 ₸."
+            "Применяются фиксированные фильтры: статус «Завершено», предмет «Работа», "
+            "способы закупки «Открытый конкурс», «Рейтингово-балльная», «Строительство под ключ», «Предквалификация»."
         )
 
         st.divider()
@@ -573,7 +560,7 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
             "🔍 Запустить анализ",
             use_container_width=True, type="primary",
             key="run_announcements",
-            disabled=not dates_valid or not bin_valid,
+            disabled=not dates_valid,
         )
 
     if run_announcements_clicked:
@@ -592,7 +579,6 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
                 "mode": "announcements",
                 "date": date_str,
                 "date_to": date_to_str,
-                "filter_bin": filter_bin if filter_bin else None,
                 "progress_file": progress_file,
             }, f, ensure_ascii=False)
 

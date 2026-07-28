@@ -130,7 +130,7 @@ def _run(bin_data: list[dict], progress_file: str, output_file: str) -> tuple[li
     return all_records, progress
 
 
-def _run_announcements(date: str, date_to: str, filter_bin: str | None, progress_file: str, output_file: str) -> tuple[list[dict], dict]:
+def _run_announcements(date: str, date_to: str, progress_file: str, output_file: str) -> tuple[list[dict], dict]:
     progress = {
         "announcement_current": 0,
         "announcement_total":   0,
@@ -153,7 +153,7 @@ def _run_announcements(date: str, date_to: str, filter_bin: str | None, progress
         _write_output(output_file, all_records)
         log.info("  сохранено %d записей", len(all_records))
 
-    result = scrape_announcements(date, on_progress=on_progress, on_record=on_record, date_to=date_to, filter_bin=filter_bin)
+    result = scrape_announcements(date, on_progress=on_progress, on_record=on_record, date_to=date_to)
 
     return all_records, progress
 
@@ -178,9 +178,8 @@ def main() -> None:
         if mode == "announcements":
             date = params.get("date")
             date_to = params.get("date_to", date)
-            filter_bin = params.get("filter_bin")
-            log.info("Парсинг объявлений: %s — %s, БИН фильтр: %s", date, date_to, filter_bin or "нет")
-            records, progress = _run_announcements(date, date_to, filter_bin, progress_file, output_file)
+            log.info("Парсинг объявлений: %s — %s", date, date_to)
+            records, progress = _run_announcements(date, date_to, progress_file, output_file)
         else:
             # Режим договоров — bins теперь список словарей [{bin, max_income}, ...]
             bin_data = params.get("bins", [])
