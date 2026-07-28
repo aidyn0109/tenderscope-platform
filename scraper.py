@@ -7,10 +7,12 @@ scraper.py — Логика парсинга реестра договоров g
   - ref_subject_type_id: 2 (Работа) — фильтруется в Python
   - crdate: 2026 год — фильтруется в Python
 
-Для каждого договора извлекаются:
-  - Сумма 1 = сумма total_sum по всем contract_units
-  - Сумма 2 = сумма fact_sum по всем contract_units
+Для каждого договора извлекаются (из раздела «Предметы договора»):
+  - Сумма 1 = сумма total_sum_wnds по всем contract_units (без НДС)
+  - Сумма 2 = сумма fact_sum_wnds по всем contract_units (без НДС)
   - Общая итоговая сумма = Сумма 1 − Сумма 2
+
+Наименование поставщика — через отдельный запрос к subjects API.
 """
 
 import logging
@@ -64,8 +66,8 @@ class ContractRecord:
     contract_number: str        # Номер договора
     description: str            # Краткое содержание
     cr_datetime: str            # Дата создания (YYYY-MM-DD HH:MM:SS)
-    amount_planned: float       # Сумма 1 (total_sum по units)
-    amount_actual: float        # Сумма 2 (fact_sum по units)
+    amount_planned: float       # Сумма 1 (total_sum_wnds по units)
+    amount_actual: float        # Сумма 2 (fact_sum_wnds по units)
     amount_total: float         # Общая итоговая сумма (Сумма1 − Сумма2)
     max_income: float           # Максимальный доход (из формы ввода)
     url: str                    # Ссылка на договор
@@ -110,7 +112,7 @@ def _get_token() -> str:
 
 
 # ---------------------------------------------------------------------------
-# GraphQL запрос
+# GraphQL запросы
 # ---------------------------------------------------------------------------
 
 _CONTRACT_QUERY = """
@@ -124,24 +126,28 @@ query($f: ContractFiltersInput, $after: Int) {
     ref_subject_type_id
     ref_contract_status_id
     fin_year
-    supplier {
-      pid
-      bin
-      name_ru
-    }
     contract_units {
       id
-      total_sum
-      fact_sum
+      total_sum_wnds
+      fact_sum_wnds
     }
   }
 }
 """
 
+_SUBJECT_QUERY = """
+query($f: SubjectFiltersInput) {
+  subjects(filters: $f) {
+    bin
+    name_ru
+  }
+}
+"""
 
-def _graphql_request(token: str, variables: dict) -> dict:
+
+def _graphql_request(token: str, query: str, variables: dict) -> dict:
     """Выполняет POST к GraphQL endpoint с retry. Возвращает распарсенный JSON."""
-    payload = {"query": _CONTRACT_QUERY, "variables": variables}
+    payload = {"query": query, "variables": variables}
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
@@ -161,7 +167,7 @@ def _graphql_request(token: str, variables: dict) -> dict:
             return resp.json()
         except Exception as exc:  # noqa: BLE001
             last_exc = exc
-            logger.warning("GraphQL contract запрос попытка %d/%d: %s",
+            logger.warning("GraphQL запрос попытка %d/%d: %s",
                            attempt + 1, RETRY_COUNT + 1, exc)
             if attempt < RETRY_COUNT:
                 time.sleep(RETRY_DELAY)
@@ -188,6 +194,37 @@ def _sum_units(units: list[dict], field: str) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Получение наименования поставщика через Subjects API
+# ---------------------------------------------------------------------------
+
+# Глобальный кэш имён поставщиков (БИН → наименование)
+_supplier_name_cache: dict[str, str] = {}
+
+
+def _fetch_supplier_name(token: str, bin_number: str) -> str:
+    """Получает наименование поставщика через subjects API. Результаты кэшируются."""
+    if bin_number in _supplier_name_cache:
+        return _supplier_name_cache[bin_number]
+
+    try:
+        resp = _graphql_request(
+            token, _SUBJECT_QUERY,
+            {"f": {"bin": bin_number}},
+        )
+        subjects = (resp.get("data") or {}).get("subjects") or []
+        if subjects:
+            name = (subjects[0].get("name_ru") or "").strip()
+            _supplier_name_cache[bin_number] = name
+            logger.info("Наименование поставщика %s: %s", bin_number, name)
+            return name
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Ошибка subjects API для БИН %s: %s", bin_number, exc)
+
+    _supplier_name_cache[bin_number] = ""
+    return ""
+
+
+# ---------------------------------------------------------------------------
 # Сбор всех договоров для одного БИН (с пагинацией)
 # ---------------------------------------------------------------------------
 
@@ -210,7 +247,7 @@ def _fetch_contracts_for_bin(
             variables["after"] = after
 
         try:
-            response = _graphql_request(token, variables)
+            response = _graphql_request(token, _CONTRACT_QUERY, variables)
         except Exception as exc:  # noqa: BLE001
             errors_sink.append(f"БИН {bin_number}: {exc}")
             break
@@ -266,12 +303,15 @@ def scrape_bin(
     """Парсит все договоры для одного БИН."""
     result = ScrapeResult(bin=bin_number, max_income=max_income)
 
+    # Получаем наименование поставщика через subjects API (один раз для БИН)
+    supplier_name = _fetch_supplier_name(token, bin_number)
+
     items = _fetch_contracts_for_bin(token, bin_number, result.errors)
 
     if not items:
         result.records.append(ContractRecord(
             bin=bin_number,
-            supplier_name="",
+            supplier_name=supplier_name or "",
             contract_number="",
             description="Договоры не найдены (после фильтрации)",
             cr_datetime="",
@@ -297,21 +337,17 @@ def scrape_bin(
         description = (item.get("description_ru") or "").strip() or "(описание отсутствует)"
         contract_number = (item.get("contract_number_sys") or "").strip()
 
-        # Наименование поставщика
-        supplier_data = item.get("supplier") or {}
-        supplier_name = (supplier_data.get("name_ru") or "").strip()
-
-        # Суммы по предметам договора (contract_units)
+        # Суммы по предметам договора (contract_units) — используем wnds (без НДС)
         units = item.get("contract_units") or []
-        amount_planned = _sum_units(units, "total_sum")    # Сумма 1
-        amount_actual = _sum_units(units, "fact_sum")       # Сумма 2
+        amount_planned = _sum_units(units, "total_sum_wnds")    # Сумма 1: без НДС
+        amount_actual = _sum_units(units, "fact_sum_wnds")       # Сумма 2: без НДС
         amount_total = round(amount_planned - amount_actual, 2)
 
         url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
 
         record = ContractRecord(
             bin=bin_number,
-            supplier_name=supplier_name,
+            supplier_name=supplier_name or "",
             contract_number=contract_number,
             description=description,
             cr_datetime=crdate,
@@ -344,6 +380,9 @@ def scrape_all(
     Главная точка входа. Принимает список словарей вида:
         {"bin": "031240001439", "max_income": 500000000.0}
     """
+    # Очищаем кэш имён при новом запуске
+    _supplier_name_cache.clear()
+
     token = _get_token()
     results: list[ScrapeResult] = []
     total_bins = len(bin_data)
@@ -391,7 +430,8 @@ if __name__ == "__main__":
         print(f"\n=== БИН {res.bin}: {len(res.records)} договоров ===")
         for rec in res.records[:5]:
             print(
-                f"  №{rec.contract_number} | {rec.description[:50]:50s} "
+                f"  Компания: {rec.supplier_name or '—'} | "
+                f"№{rec.contract_number} | {rec.description[:50]:50s} "
                 f"| план: {rec.amount_planned:,.0f} | факт: {rec.amount_actual:,.0f} "
                 f"| итого: {rec.amount_total:,.2f} ₸ | макс.доход: {rec.max_income:,.0f}"
             )
