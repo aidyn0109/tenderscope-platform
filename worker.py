@@ -71,31 +71,14 @@ def _rec_to_dict(rec: ContractRecord) -> dict:
 
 def _ann_to_dict(rec: AnnouncementRecord) -> dict:
     return {
-        "number":        rec.number,
-        "name":          rec.name,
-        "method":        rec.method,
-        "start_date":    rec.start_date,
-        "end_date":      rec.end_date,
-        "sum_amount":    rec.sum_amount,
-        "status":        rec.status,
-        "winner_name":   rec.winner_name,
-        "winner_bin":    rec.winner_bin,
-        "winner_price":  rec.winner_price,
-        "url":           rec.url,
-        "has_contracts": rec.has_contracts,
-        "error":         rec.error,
-        "lots": [
-            {
-                "lot_number":   lot.lot_number,
-                "lot_name":     lot.lot_name,
-                "lot_amount":   lot.lot_amount,
-                "winner_name":  lot.winner_name,
-                "winner_bin":   lot.winner_bin,
-                "winner_price": lot.winner_price,
-                "year1_sum":    lot.year1_sum,
-            }
-            for lot in rec.lots
-        ],
+        "bin":                  rec.bin,
+        "supplier_name":        rec.supplier_name,
+        "announcement_number":  rec.announcement_number,
+        "announcement_name":    rec.announcement_name,
+        "year1_sum":            rec.year1_sum,
+        "protocol_url":         rec.protocol_url,
+        "announcement_url":     rec.announcement_url,
+        "error":                rec.error,
     }
 
 

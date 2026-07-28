@@ -799,46 +799,27 @@ if st.session_state.running:
             all_recs = data.get("records", [])
 
             if st.session_state.mode == "announcements":
-                from scraper_announcements import AnnouncementRecord, LotRecord, ScrapeAnnouncementsResult
+                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
 
                 def _deserialize_announcement(r: dict) -> AnnouncementRecord:
-                    lots = [
-                        LotRecord(
-                            lot_number=lot.get("lot_number", ""),
-                            lot_name=lot.get("lot_name", ""),
-                            lot_amount=lot.get("lot_amount", 0.0),
-                            winner_name=lot.get("winner_name", ""),
-                            winner_bin=lot.get("winner_bin", ""),
-                            winner_price=lot.get("winner_price", 0.0),
-                            year1_sum=lot.get("year1_sum", 0.0),
-                        )
-                        for lot in r.get("lots", [])
-                    ]
                     return AnnouncementRecord(
-                        number=r.get("number", 0),
-                        name=r.get("name", ""),
-                        method=r.get("method", ""),
-                        start_date=r.get("start_date", ""),
-                        end_date=r.get("end_date", ""),
-                        sum_amount=r.get("sum_amount", 0.0),
-                        status=r.get("status", ""),
-                        winner_name=r.get("winner_name", ""),
-                        winner_bin=r.get("winner_bin", ""),
-                        winner_price=r.get("winner_price", 0.0),
-                        url=r.get("url", ""),
-                        has_contracts=r.get("has_contracts", False),
+                        bin=r.get("bin", ""),
+                        supplier_name=r.get("supplier_name", ""),
+                        announcement_number=r.get("announcement_number", ""),
+                        announcement_name=r.get("announcement_name", ""),
+                        year1_sum=r.get("year1_sum", 0.0),
+                        protocol_url=r.get("protocol_url", ""),
+                        announcement_url=r.get("announcement_url", ""),
                         error=r.get("error", ""),
-                        lots=lots,
                     )
 
                 results = ScrapeAnnouncementsResult(
-                    selected_date=st.session_state.selected_date,
-                    records=[_deserialize_announcement(r) for r in all_recs],
+                    results=[_deserialize_announcement(r) for r in all_recs],
                 )
                 log.info("Загружено %d объявлений", len(all_recs))
 
                 excel_bytes = None
-                if results.records:
+                if results.results:
                     try:
                         excel_bytes = build_excel_announcements_report(results)
                     except Exception as exc:
@@ -898,41 +879,22 @@ if st.session_state.running:
             log.warning("Воркер завершился досрочно. Частичных записей: %d", len(partial))
 
             if st.session_state.mode == "announcements":
-                from scraper_announcements import AnnouncementRecord, LotRecord, ScrapeAnnouncementsResult
+                from scraper_announcements import AnnouncementRecord, ScrapeAnnouncementsResult
 
                 def _deserialize_announcement_partial(r: dict) -> AnnouncementRecord:
-                    lots = [
-                        LotRecord(
-                            lot_number=lot.get("lot_number", ""),
-                            lot_name=lot.get("lot_name", ""),
-                            lot_amount=lot.get("lot_amount", 0.0),
-                            winner_name=lot.get("winner_name", ""),
-                            winner_bin=lot.get("winner_bin", ""),
-                            winner_price=lot.get("winner_price", 0.0),
-                            year1_sum=lot.get("year1_sum", 0.0),
-                        )
-                        for lot in r.get("lots", [])
-                    ]
                     return AnnouncementRecord(
-                        number=r.get("number", 0),
-                        name=r.get("name", ""),
-                        method=r.get("method", ""),
-                        start_date=r.get("start_date", ""),
-                        end_date=r.get("end_date", ""),
-                        sum_amount=r.get("sum_amount", 0.0),
-                        status=r.get("status", ""),
-                        winner_name=r.get("winner_name", ""),
-                        winner_bin=r.get("winner_bin", ""),
-                        winner_price=r.get("winner_price", 0.0),
-                        url=r.get("url", ""),
-                        has_contracts=r.get("has_contracts", False),
+                        bin=r.get("bin", ""),
+                        supplier_name=r.get("supplier_name", ""),
+                        announcement_number=r.get("announcement_number", ""),
+                        announcement_name=r.get("announcement_name", ""),
+                        year1_sum=r.get("year1_sum", 0.0),
+                        protocol_url=r.get("protocol_url", ""),
+                        announcement_url=r.get("announcement_url", ""),
                         error=r.get("error", ""),
-                        lots=lots,
                     )
 
                 results = ScrapeAnnouncementsResult(
-                    selected_date=st.session_state.selected_date,
-                    records=[_deserialize_announcement_partial(r) for r in partial],
+                    results=[_deserialize_announcement_partial(r) for r in partial],
                 )
                 excel_bytes = None
                 try:
@@ -1087,7 +1049,7 @@ if st.session_state.results_announcements is not None and not st.session_state.r
 
     results: ScrapeAnnouncementsResult = st.session_state.results_announcements
 
-    if not results.records:
+    if not results.results:
         worker_err = st.session_state.get("worker_error")
         if worker_err:
             st.error(f"❌ Ошибка: {worker_err}")
@@ -1108,43 +1070,32 @@ if st.session_state.results_announcements is not None and not st.session_state.r
             st.success("✅ Анализ объявлений успешно завершён!")
         st.markdown("#### 📊 Результаты объявлений")
 
-        total_announcements = len(results.records)
+        total_announcements = len(results.results)
         total_errors = len(results.errors)
-        total_sum = sum(r.sum_amount for r in results.records if r.sum_amount > 0)
-        total_price = sum(r.winner_price for r in results.records if r.winner_price > 0)
+        total_year1 = sum(r.year1_sum for r in results.results if r.year1_sum > 0)
 
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         c1.metric("Всего объявлений", total_announcements)
         c2.metric("Ошибок при сборе", total_errors)
-        c3.metric("Сумма закупок",   f"{total_sum:,.0f} ₸")
-        c4.metric("Цена победителей",f"{total_price:,.0f} ₸")
+        c3.metric("Сумма 1 год", f"{total_year1:,.0f} ₸")
         st.divider()
 
-        for rec in results.records[:15]:
+        for rec in results.results[:15]:
             has_error = bool(rec.error)
             icon = "⚠️" if has_error else "📢"
-            winner_info = (
-                f"{rec.winner_name} (БИН: {rec.winner_bin})"
-                if rec.winner_bin else "—"
-            )
-            if rec.has_contracts:
-                price_str = "(есть договоры — цена пуста)"
-            elif rec.winner_price > 0:
-                price_str = f"{rec.winner_price:,.0f} ₸"
-            else:
-                price_str = "—"
+            year1_str = f"{rec.year1_sum:,.0f} ₸" if rec.year1_sum > 0 else "—"
 
             st.markdown(
-                f"{icon} **№{rec.number}. {rec.name[:70] or '(без названия)'}**  \n"
-                f"Способ: `{rec.method or '—'}` | Статус: `{rec.status or '—'}`  \n"
-                f"Сумма: `{rec.sum_amount:,.0f} ₸` | Победитель: `{winner_info}` | Цена: `{price_str}`  \n"
-                f"Даты: `{rec.start_date}` — `{rec.end_date}`"
-                + (f"  — [{rec.url}]({rec.url})" if rec.url else "")
+                f"{icon} **№{rec.announcement_number}. {rec.announcement_name[:70] or '(без названия)'}**  \n"
+                f"БИН: `{rec.bin}` | Компания: `{rec.supplier_name or '—'}`  \n"
+                f"Сумма 1 год: `{year1_str}`"
+                + (f"  — [Протокол]({rec.protocol_url})" if rec.protocol_url else "")
+                + (f"  — [Объявление]({rec.announcement_url})" if rec.announcement_url else "")
             )
             st.divider()
 
-        if len(results.records) > 15:
-            st.caption(f"... и ещё {len(results.records) - 15} объявлений в Excel-файле")
+        if len(results.results) > 15:
+            st.caption(f"... и ещё {len(results.results) - 15} объявлений в Excel-файле")
 
         st.divider()
         if st.session_state.excel_bytes:

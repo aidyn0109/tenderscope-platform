@@ -1,7 +1,14 @@
 """
 excel_export_announcements.py — Формирование Excel-отчёта по результатам парсинга объявлений.
-Каждый лот объявления выводится отдельной строкой.
 
+Новая структура (каждое объявление = одна строка):
+  - БИН
+  - Наименование компании
+  - Номер объявления
+  - Наименование объявления
+  - Сумма 1 год (тг)
+  - Ссылка на протокол
+  - Ссылка на объявление
 """
 
 import io
@@ -20,31 +27,23 @@ CELL_FONT    = Font(name="Arial", size=10)
 LINK_FONT    = Font(name="Arial", size=10, color="0563C1", underline="single")
 SUMMARY_FONT = Font(name="Arial", bold=True, size=10)
 HEADER_FILL  = PatternFill(fill_type="solid", fgColor="D9D9D9")
-LOT_FILL     = PatternFill(fill_type="solid", fgColor="EBF3FB")  # голубоватый для строк лотов
+SUMMARY_FILL = PatternFill(fill_type="solid", fgColor="F2F2F2")
 
 THIN_SIDE   = Side(style="thin", color="BFBFBF")
 THIN_BORDER = Border(left=THIN_SIDE, right=THIN_SIDE, top=THIN_SIDE, bottom=THIN_SIDE)
 
 NUMBER_FORMAT = "#,##0.00"
 
-# Столбцы листа "Объявления"
 COL_HEADERS = [
-    "№",                                    # A
-    "Наименование объявления",              # B
-    "Способ",                               # C
-    "Начало приема заявок",                 # D
-    "Окончание приема заявок",              # E
-    "Сумма закупки, тг.",                   # F
-    "Статус",                               # G
-    "№ лота",                               # H
-    "Наименование лота",                    # I
-    "Наименование победителя конкурса",     # J
-    "БИН победителя",                       # K
-    "Цена победителя, тг.",                 # L
-    "Сумма 1 год, тг.",                     # M  ← новый столбец
-    "Гиперссылка на объявление",            # N
+    "БИН",
+    "Наименование компании",
+    "Номер объявления",
+    "Наименование объявления",
+    "Сумма 1 год (тг)",
+    "Ссылка на протокол",
+    "Ссылка на объявление",
 ]
-COL_WIDTHS = [6, 45, 20, 22, 22, 20, 22, 18, 40, 35, 16, 20, 20, 50]
+COL_WIDTHS = [16, 35, 22, 55, 24, 50, 50]
 
 
 def _apply_header_style(cell, text: str) -> None:
@@ -55,13 +54,9 @@ def _apply_header_style(cell, text: str) -> None:
     cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
 
 
-def _apply_cell_style(cell, value, *, is_number: bool = False,
-                      is_link: bool = False, fill=None) -> None:
+def _apply_cell_style(cell, value, *, is_number: bool = False, is_link: bool = False) -> None:
     cell.value = value
     cell.border = THIN_BORDER
-    if fill:
-        cell.fill = fill
-
     if is_link:
         cell.font = LINK_FONT
         cell.alignment = Alignment(vertical="top", wrap_text=False)
@@ -85,192 +80,80 @@ def _write_announcements_sheet(wb: Workbook, result: ScrapeAnnouncementsResult) 
         ws.column_dimensions[get_column_letter(col_idx)].width = width
 
     row_idx = 2
-    total_price = 0.0
-    total_sum = 0.0
     total_year1 = 0.0
 
-    for record in result.records:
-        lots = record.lots
+    for record in result.results:
+        ws.row_dimensions[row_idx].height = 15
 
-        # Если лотов нет — выводим одну строку без данных о лоте
-        if not lots:
-            ws.row_dimensions[row_idx].height = 15
-            _write_announcement_row(ws, row_idx, record,
-                                    lot_number="", lot_name="",
-                                    winner_name=record.winner_name,
-                                    winner_bin=record.winner_bin,
-                                    winner_price=record.winner_price,
-                                    year1_sum=0.0,
-                                    is_first_lot=True)
-            if record.winner_price > 0:
-                total_price += record.winner_price
-            if record.sum_amount > 0:
-                total_sum += record.sum_amount
-            row_idx += 1
-            continue
+        # A — БИН
+        _apply_cell_style(ws.cell(row=row_idx, column=1), record.bin)
 
-        # Выводим строку для каждого лота
-        for lot_idx, lot in enumerate(lots):
-            ws.row_dimensions[row_idx].height = 15
-            is_first = (lot_idx == 0)
-            _write_announcement_row(
-                ws, row_idx, record,
-                lot_number=lot.lot_number,
-                lot_name=lot.lot_name,
-                winner_name=lot.winner_name,
-                winner_bin=lot.winner_bin,
-                winner_price=lot.winner_price,
-                year1_sum=lot.year1_sum,
-                is_first_lot=is_first,
-                fill=None if is_first else LOT_FILL,
-            )
-            if lot.winner_price > 0:
-                total_price += lot.winner_price
-            if lot.year1_sum > 0:
-                total_year1 += lot.year1_sum
-            row_idx += 1
+        # B — Наименование компании
+        _apply_cell_style(ws.cell(row=row_idx, column=2), record.supplier_name or "—")
 
-        # Суммируем сумму объявления один раз
-        if record.sum_amount > 0:
-            total_sum += record.sum_amount
+        # C — Номер объявления
+        _apply_cell_style(ws.cell(row=row_idx, column=3), record.announcement_number or "—")
+
+        # D — Наименование объявления
+        _apply_cell_style(ws.cell(row=row_idx, column=4), record.announcement_name or "—")
+
+        # E — Сумма 1 год
+        cell_e = ws.cell(row=row_idx, column=5)
+        if record.year1_sum > 0:
+            _apply_cell_style(cell_e, record.year1_sum, is_number=True)
+            total_year1 += record.year1_sum
+        else:
+            _apply_cell_style(cell_e, "—")
+
+        # F — Ссылка на протокол
+        cell_f = ws.cell(row=row_idx, column=6)
+        if record.protocol_url:
+            cell_f.value = record.protocol_url
+            cell_f.hyperlink = record.protocol_url
+            cell_f.font = LINK_FONT
+            cell_f.border = THIN_BORDER
+            cell_f.alignment = Alignment(vertical="top", wrap_text=False)
+        else:
+            _apply_cell_style(cell_f, "—")
+
+        # G — Ссылка на объявление
+        cell_g = ws.cell(row=row_idx, column=7)
+        if record.announcement_url:
+            cell_g.value = record.announcement_url
+            cell_g.hyperlink = record.announcement_url
+            cell_g.font = LINK_FONT
+            cell_g.border = THIN_BORDER
+            cell_g.alignment = Alignment(vertical="top", wrap_text=False)
+        else:
+            _apply_cell_style(cell_g, "—")
+
+        row_idx += 1
 
     # Итоговая строка
     ws.row_dimensions[row_idx].height = 20
     for col_idx in range(1, len(COL_HEADERS) + 1):
         cell = ws.cell(row=row_idx, column=col_idx)
-        cell.fill = PatternFill(fill_type="solid", fgColor="F2F2F2")
+        cell.fill = SUMMARY_FILL
         cell.border = THIN_BORDER
         cell.font = SUMMARY_FONT
 
-    lbl = ws.cell(row=row_idx, column=2)
+    lbl = ws.cell(row=row_idx, column=4)
     lbl.value = "ИТОГО:"
     lbl.alignment = Alignment(horizontal="right", vertical="center")
 
-    cell_sum = ws.cell(row=row_idx, column=6)
-    cell_sum.value = total_sum
-    cell_sum.number_format = NUMBER_FORMAT
-    cell_sum.alignment = Alignment(horizontal="right", vertical="center")
-
-    cell_price = ws.cell(row=row_idx, column=12)
-    cell_price.value = total_price
-    cell_price.number_format = NUMBER_FORMAT
-    cell_price.alignment = Alignment(horizontal="right", vertical="center")
-
-    cell_year1 = ws.cell(row=row_idx, column=13)
-    cell_year1.value = total_year1 if total_year1 > 0 else ""
-    if total_year1 > 0:
-        cell_year1.number_format = NUMBER_FORMAT
-        cell_year1.alignment = Alignment(horizontal="right", vertical="center")
+    cell_total = ws.cell(row=row_idx, column=5)
+    cell_total.value = total_year1
+    cell_total.number_format = NUMBER_FORMAT
+    cell_total.alignment = Alignment(horizontal="right", vertical="center")
 
     ws.freeze_panes = "A2"
-
-
-def _write_announcement_row(
-    ws,
-    row_idx: int,
-    record: AnnouncementRecord,
-    lot_number: str,
-    lot_name: str,
-    winner_name: str,
-    winner_bin: str,
-    winner_price: float,
-    year1_sum: float,
-    is_first_lot: bool = True,
-    fill=None,
-) -> None:
-    """Записывает одну строку (один лот одного объявления)."""
-
-    # A — № (только в первой строке объявления)
-    _apply_cell_style(ws.cell(row=row_idx, column=1),
-                      record.number if is_first_lot else "", fill=fill)
-
-    # B — Наименование объявления (только в первой строке)
-    if is_first_lot:
-        if record.name:
-            _apply_cell_style(ws.cell(row=row_idx, column=2), record.name, fill=fill)
-        elif record.error:
-            _apply_cell_style(ws.cell(row=row_idx, column=2),
-                              f"⚠ {record.error}", fill=fill)
-        else:
-            _apply_cell_style(ws.cell(row=row_idx, column=2), "", fill=fill)
-    else:
-        _apply_cell_style(ws.cell(row=row_idx, column=2), "", fill=fill)
-
-    # C — Способ (только в первой строке)
-    _apply_cell_style(ws.cell(row=row_idx, column=3),
-                      record.method if is_first_lot else "", fill=fill)
-
-    # D — Начало приема заявок (только в первой строке)
-    _apply_cell_style(ws.cell(row=row_idx, column=4),
-                      record.start_date if is_first_lot else "", fill=fill)
-
-    # E — Окончание приема заявок (только в первой строке)
-    _apply_cell_style(ws.cell(row=row_idx, column=5),
-                      record.end_date if is_first_lot else "", fill=fill)
-
-    # F — Сумма закупки (только в первой строке)
-    cell_f = ws.cell(row=row_idx, column=6)
-    if is_first_lot and record.sum_amount > 0:
-        _apply_cell_style(cell_f, record.sum_amount, is_number=True, fill=fill)
-    else:
-        _apply_cell_style(cell_f, "" if is_first_lot else "—", fill=fill)
-
-    # G — Статус (только в первой строке)
-    _apply_cell_style(ws.cell(row=row_idx, column=7),
-                      record.status if is_first_lot else "", fill=fill)
-
-    # H — № лота
-    _apply_cell_style(ws.cell(row=row_idx, column=8), lot_number or "—", fill=fill)
-
-    # I — Наименование лота
-    _apply_cell_style(ws.cell(row=row_idx, column=9),
-                      lot_name if lot_name else "—", fill=fill)
-
-    # J — Наименование победителя
-    _apply_cell_style(ws.cell(row=row_idx, column=10),
-                      winner_name if winner_name else "—", fill=fill)
-
-    # K — БИН победителя
-    _apply_cell_style(ws.cell(row=row_idx, column=11),
-                      winner_bin if winner_bin else "—", fill=fill)
-
-    # L — Цена победителя
-    cell_l = ws.cell(row=row_idx, column=12)
-    if record.has_contracts and not winner_price:
-        _apply_cell_style(cell_l, "", fill=fill)
-    elif winner_price > 0:
-        _apply_cell_style(cell_l, winner_price, is_number=True, fill=fill)
-    else:
-        _apply_cell_style(cell_l, "—", fill=fill)
-
-    # M — Сумма 1 год
-    cell_m = ws.cell(row=row_idx, column=13)
-    if year1_sum > 0:
-        _apply_cell_style(cell_m, year1_sum, is_number=True, fill=fill)
-    else:
-        _apply_cell_style(cell_m, "—", fill=fill)
-
-    # N — Гиперссылка (только в первой строке)
-    cell_n = ws.cell(row=row_idx, column=14)
-    if is_first_lot and record.url:
-        cell_n.value = record.url
-        cell_n.hyperlink = record.url
-        cell_n.font = LINK_FONT
-        cell_n.border = THIN_BORDER
-        cell_n.alignment = Alignment(vertical="top", wrap_text=False)
-        if fill:
-            cell_n.fill = fill
-    else:
-        _apply_cell_style(cell_n, "", fill=fill)
 
 
 def build_excel_announcements_report(result: ScrapeAnnouncementsResult) -> bytes:
     wb = Workbook()
     if "Sheet" in wb.sheetnames:
         del wb["Sheet"]
-
     _write_announcements_sheet(wb, result)
-
     buffer = io.BytesIO()
     wb.save(buffer)
     return buffer.getvalue()
