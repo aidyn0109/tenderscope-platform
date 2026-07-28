@@ -1,5 +1,5 @@
 """
-scraper.py — Логика парсинга реестра договоров goszakup.gov.kz через GraphQL API v2.
+scraper.py — Логика парсинга реестра договоров goszakup.gov.kz через GraphQL API v2 + v3.
 
 Фильтры (соответствуют URL реестра):
   - supplier_biin — БИН поставщика
@@ -7,12 +7,15 @@ scraper.py — Логика парсинга реестра договоров g
   - ref_subject_type_id: 2 (Работа) — фильтруется в Python
   - crdate: 2026 год — фильтруется в Python
 
-Для каждого договора извлекаются (из раздела «Предметы договора»):
-  - Сумма 1 = сумма total_sum_wnds по всем contract_units (без НДС)
-  - Сумма 2 = сумма fact_sum_wnds по всем contract_units (без НДС)
-  - Общая итоговая сумма = Сумма 1 − Сумма 2
-
-Наименование поставщика — через отдельный запрос к subjects API.
+Для каждого договора извлекаются данные из раздела «Предметы договора»:
+  Алгоритм выбора unit:
+    1. Из всех contract_units выбираем unit с минимальным item_price (> 0)
+    2. Если fact_sum > 0 → Сценарий 1 (обычный):
+       - Сумма 1 = item_price (Сумма по предмету договора без НДС)
+       - Сумма 2 = fact_sum (Сумма исполненная, фактическая)
+    3. Если fact_sum == 0 → Сценарий 2 (v3 ContractSpecSum):
+       - Сумма 1 = planSum за текущий год (Утвержденная планируемая сумма)
+       - Сумма 2 = factSum за текущий год
 """
 
 import logging
@@ -35,7 +38,8 @@ except Exception:  # noqa: BLE001
 # Конфигурация
 # ---------------------------------------------------------------------------
 
-GRAPHQL_ENDPOINT = "https://ows.goszakup.gov.kz/v2/graphql"
+GRAPHQL_V2 = "https://ows.goszakup.gov.kz/v2/graphql"
+GRAPHQL_V3 = "https://ows.goszakup.gov.kz/v3/graphql"
 REQUEST_TIMEOUT = 60
 RETRY_COUNT = 2
 RETRY_DELAY = 3
@@ -44,10 +48,7 @@ MAX_RECORDS = 10_000
 
 CONTRACT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/egzcontract/cpublic/show/{id}"
 
-# 190 = Действует, 460 = Передан.Действует, 450 = Создано доп.соглашение
 TARGET_STATUS_IDS = [190, 460, 450]
-
-# Фильтр по году создания и типу предмета
 TARGET_YEAR = 2026
 TARGET_SUBJECT_TYPE_ID = 2  # Работа
 
@@ -61,22 +62,21 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ContractRecord:
     """Одна запись о договоре."""
-    bin: str                    # БИН поставщика
-    supplier_name: str          # Наименование компании
-    contract_number: str        # Номер договора
-    description: str            # Краткое содержание
-    cr_datetime: str            # Дата создания (YYYY-MM-DD HH:MM:SS)
-    amount_planned: float       # Сумма 1 (total_sum_wnds по units)
-    amount_actual: float        # Сумма 2 (fact_sum_wnds по units)
-    amount_total: float         # Общая итоговая сумма (Сумма1 − Сумма2)
-    max_income: float           # Максимальный доход (из формы ввода)
-    url: str                    # Ссылка на договор
-    error: str = ""             # Ошибка парсинга (если есть)
+    bin: str
+    supplier_name: str
+    contract_number: str
+    description: str
+    cr_datetime: str
+    amount_planned: float       # Сумма 1
+    amount_actual: float        # Сумма 2
+    amount_total: float         # Сумма1 − Сумма2
+    max_income: float
+    url: str
+    error: str = ""
 
 
 @dataclass
 class ScrapeResult:
-    """Результат парсинга для одного БИН."""
     bin: str
     max_income: float = 0.0
     records: list[ContractRecord] = field(default_factory=list)
@@ -92,29 +92,26 @@ RecordCallback = Callable[["ContractRecord"], None]
 # ---------------------------------------------------------------------------
 
 def _get_token() -> str:
-    """Читает Bearer-токен из env или st.secrets. Иначе RuntimeError."""
     token = (os.environ.get("GOSZAKUP_TOKEN") or "").strip()
     if token:
         return token
     if st is not None:
         try:
-            secret = st.secrets.get("goszakup_token")  # type: ignore[attr-defined]
+            secret = st.secrets.get("goszakup_token")
             if secret:
                 secret = str(secret).strip()
                 if secret:
                     return secret
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
-    raise RuntimeError(
-        "Токен Goszakup API не найден. Установите переменную окружения "
-        "GOSZAKUP_TOKEN или ключ st.secrets['goszakup_token']."
-    )
+    raise RuntimeError("Токен Goszakup API не найден.")
 
 
 # ---------------------------------------------------------------------------
 # GraphQL запросы
 # ---------------------------------------------------------------------------
 
+# v2: список договоров + contract_units
 _CONTRACT_QUERY = """
 query($f: ContractFiltersInput, $after: Int) {
   contract(limit: 50, after: $after, filters: $f) {
@@ -135,6 +132,7 @@ query($f: ContractFiltersInput, $after: Int) {
 }
 """
 
+# v2: subjects API
 _SUBJECT_QUERY = """
 query($f: SubjectFiltersInput) {
   subjects(filters: $f) {
@@ -144,9 +142,24 @@ query($f: SubjectFiltersInput) {
 }
 """
 
+# v3: ContractSpecSum для unit (сценарий 2)
+_SPECSUM_QUERY = """
+query($f: ObContractFiltersInput) {
+  ObContract(limit: 1, filter: $f) {
+    id
+    ContractSpecSum {
+      id
+      unitId
+      finYear
+      planSum
+      factSum
+    }
+  }
+}
+"""
 
-def _graphql_request(token: str, query: str, variables: dict) -> dict:
-    """Выполняет POST к GraphQL endpoint с retry. Возвращает распарсенный JSON."""
+
+def _graphql_request(endpoint: str, token: str, query: str, variables: dict) -> dict:
     payload = {"query": query, "variables": variables}
     headers = {
         "Authorization": f"Bearer {token}",
@@ -157,7 +170,7 @@ def _graphql_request(token: str, query: str, variables: dict) -> dict:
     for attempt in range(RETRY_COUNT + 1):
         try:
             resp = requests.post(
-                GRAPHQL_ENDPOINT,
+                endpoint,
                 json=payload,
                 headers=headers,
                 timeout=REQUEST_TIMEOUT,
@@ -165,13 +178,20 @@ def _graphql_request(token: str, query: str, variables: dict) -> dict:
             )
             resp.raise_for_status()
             return resp.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             last_exc = exc
-            logger.warning("GraphQL запрос попытка %d/%d: %s",
-                           attempt + 1, RETRY_COUNT + 1, exc)
+            logger.warning("GraphQL попытка %d/%d: %s", attempt + 1, RETRY_COUNT + 1, exc)
             if attempt < RETRY_COUNT:
                 time.sleep(RETRY_DELAY)
-    raise RuntimeError(f"GraphQL запрос завершился ошибкой: {last_exc}")
+    raise RuntimeError(f"GraphQL ошибка: {last_exc}")
+
+
+def _v2_request(token: str, query: str, variables: dict) -> dict:
+    return _graphql_request(GRAPHQL_V2, token, query, variables)
+
+
+def _v3_request(token: str, query: str, variables: dict) -> dict:
+    return _graphql_request(GRAPHQL_V3, token, query, variables)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +199,6 @@ def _graphql_request(token: str, query: str, variables: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def _to_float(value) -> float:
-    """Безопасное преобразование в float."""
     if value is None:
         return 0.0
     try:
@@ -189,51 +208,113 @@ def _to_float(value) -> float:
 
 
 def _sum_units(units: list[dict], field: str) -> float:
-    """Суммирует значения поля field по всем contract_units."""
     return sum(_to_float(u.get(field)) for u in units if u.get(field) is not None)
 
 
 # ---------------------------------------------------------------------------
-# Получение наименования поставщика через Subjects API
+# Кэш имён поставщиков
 # ---------------------------------------------------------------------------
 
-# Глобальный кэш имён поставщиков (БИН → наименование)
 _supplier_name_cache: dict[str, str] = {}
 
 
 def _fetch_supplier_name(token: str, bin_number: str) -> str:
-    """Получает наименование поставщика через subjects API. Результаты кэшируются."""
     if bin_number in _supplier_name_cache:
         return _supplier_name_cache[bin_number]
-
     try:
-        resp = _graphql_request(
-            token, _SUBJECT_QUERY,
-            {"f": {"bin": bin_number}},
-        )
+        resp = _v2_request(token, _SUBJECT_QUERY, {"f": {"bin": bin_number}})
         subjects = (resp.get("data") or {}).get("subjects") or []
         if subjects:
             name = (subjects[0].get("name_ru") or "").strip()
             _supplier_name_cache[bin_number] = name
-            logger.info("Наименование поставщика %s: %s", bin_number, name)
+            logger.info("Поставщик %s: %s", bin_number, name)
             return name
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Ошибка subjects API для БИН %s: %s", bin_number, exc)
-
+    except Exception as exc:
+        logger.warning("Ошибка subjects API для %s: %s", bin_number, exc)
     _supplier_name_cache[bin_number] = ""
     return ""
 
 
 # ---------------------------------------------------------------------------
-# Сбор всех договоров для одного БИН (с пагинацией)
+# Выбор правильного unit и расчёт сумм
 # ---------------------------------------------------------------------------
 
-def _fetch_contracts_for_bin(
-    token: str,
-    bin_number: str,
-    errors_sink: list[str],
-) -> list[dict]:
-    """Загружает все договоры для БИН через GraphQL API v2 с пагинацией."""
+def _pick_best_unit(units: list[dict]) -> dict | None:
+    """
+    Из всех contract_units выбирает правильный unit:
+    — с минимальным item_price (> 0), так как основной предмет договора
+      имеет меньшую стоимость чем общая сумма контракта.
+    """
+    positive = [u for u in units if _to_float(u.get("item_price")) > 0]
+    if not positive:
+        return units[0] if units else None
+    return min(positive, key=lambda u: _to_float(u.get("item_price")))
+
+
+def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[float, float]:
+    """
+    Возвращает (amount_planned, amount_actual) для контракта.
+    Сценарий 1: unit.fact_sum > 0 → item_price / fact_sum
+    Сценарий 2: unit.fact_sum == 0 → ContractSpecSum planSum/factSum за TARGET_YEAR
+    """
+    unit = _pick_best_unit(units)
+    if not unit:
+        return 0.0, 0.0
+
+    fact_sum = _to_float(unit.get("fact_sum"))
+    item_price = _to_float(unit.get("item_price"))
+
+    if fact_sum > 0:
+        # Сценарий 1: обычная таблица view-subject
+        return item_price, fact_sum
+
+    # Сценарий 2: нужно через v3 ContractSpecSum
+    unit_id = unit.get("id")
+    if not unit_id or not contract_id:
+        logger.warning("Нет unit_id или contract_id для сценария 2")
+        return item_price, fact_sum
+
+    try:
+        resp = _v3_request(token, _SPECSUM_QUERY, {"f": {"id": [contract_id]}})
+        ob = ((resp.get("data") or {}).get("ObContract") or [None])[0]
+        if not ob:
+            return item_price, fact_sum
+
+        spec_sums = ob.get("ContractSpecSum") or []
+        # Фильтруем: unitId совпадает + finYear == TARGET_YEAR
+        year_specs = [
+            ss for ss in spec_sums
+            if ss.get("unitId") == unit_id and ss.get("finYear") == TARGET_YEAR
+        ]
+        if year_specs:
+            ss = year_specs[0]
+            plan_sum = _to_float(ss.get("planSum"))
+            spec_fact = _to_float(ss.get("factSum"))
+            logger.info(
+                "Сценарий 2 (ContractSpecSum): unit=%d, year=%d, planSum=%.2f, factSum=%.2f",
+                unit_id, TARGET_YEAR, plan_sum, spec_fact,
+            )
+            return plan_sum, spec_fact
+
+        # Fallback: если нет за текущий год — суммируем все года для этого unit
+        all_for_unit = [ss for ss in spec_sums if ss.get("unitId") == unit_id]
+        if all_for_unit:
+            total_plan = sum(_to_float(ss.get("planSum")) for ss in all_for_unit)
+            total_fact = sum(_to_float(ss.get("factSum")) for ss in all_for_unit)
+            logger.info("Сценарий 2 (fallback): unit=%d, total planSum=%.2f", unit_id, total_plan)
+            return total_plan, total_fact
+
+    except Exception as exc:
+        logger.warning("Ошибка v3 ContractSpecSum для contract=%d: %s", contract_id, exc)
+
+    return item_price, fact_sum
+
+
+# ---------------------------------------------------------------------------
+# Сбор договоров для БИН
+# ---------------------------------------------------------------------------
+
+def _fetch_contracts_for_bin(token: str, bin_number: str, errors_sink: list[str]) -> list[dict]:
     items: list[dict] = []
     after: int | None = None
     filter_input = {
@@ -245,47 +326,36 @@ def _fetch_contracts_for_bin(
         variables: dict = {"f": filter_input}
         if after is not None:
             variables["after"] = after
-
         try:
-            response = _graphql_request(token, _CONTRACT_QUERY, variables)
-        except Exception as exc:  # noqa: BLE001
+            response = _v2_request(token, _CONTRACT_QUERY, variables)
+        except Exception as exc:
             errors_sink.append(f"БИН {bin_number}: {exc}")
             break
-
         gql_errors = response.get("errors")
         if gql_errors:
             msg = "; ".join(str(e.get("message", e)) for e in gql_errors)
             errors_sink.append(f"GraphQL error: {msg}")
             break
-
         data = response.get("data") or {}
         batch = data.get("contract") or []
         items.extend(batch)
-
         page_info = (response.get("extensions") or {}).get("pageInfo") or {}
         has_next = bool(page_info.get("hasNextPage"))
         last_id = page_info.get("lastId")
-
         if not batch or not has_next or last_id is None or len(items) >= MAX_RECORDS:
             break
         after = last_id
 
-    # Фильтрация в Python: только тип "Работа" и только 2026 год
     filtered = []
     for item in items:
-        # Проверка типа предмета (Работа = 2)
         if item.get("ref_subject_type_id") != TARGET_SUBJECT_TYPE_ID:
             continue
-        # Проверка года создания
         crdate = str(item.get("crdate") or "")
         if not crdate.startswith(str(TARGET_YEAR)):
             continue
         filtered.append(item)
 
-    logger.info(
-        "БИН %s: загружено %d записей, после фильтрации (subject_type=2, year=%d) — %d",
-        bin_number, len(items), TARGET_YEAR, len(filtered),
-    )
+    logger.info("БИН %s: всего %d, после фильтрации — %d", bin_number, len(items), len(filtered))
     return filtered
 
 
@@ -300,14 +370,10 @@ def scrape_bin(
     on_contract_progress: ProgressCallback | None = None,
     on_record: RecordCallback | None = None,
 ) -> ScrapeResult:
-    """Парсит все договоры для одного БИН."""
     result = ScrapeResult(bin=bin_number, max_income=max_income)
-
-    # Получаем наименование поставщика через subjects API (один раз для БИН)
     supplier_name = _fetch_supplier_name(token, bin_number)
 
     items = _fetch_contracts_for_bin(token, bin_number, result.errors)
-
     if not items:
         result.records.append(ContractRecord(
             bin=bin_number,
@@ -329,21 +395,18 @@ def scrape_bin(
         if on_contract_progress:
             try:
                 on_contract_progress(idx, total, f"Договор {idx} из {total}")
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("on_contract_progress callback error: %s", exc)
+            except Exception:
+                pass
 
         cid = item.get("id")
         crdate = (item.get("crdate") or "").strip()
         description = (item.get("description_ru") or "").strip() or "(описание отсутствует)"
         contract_number = (item.get("contract_number_sys") or "").strip()
-
-        # Суммы по предметам договора (contract_units) — без НДС
-        units = item.get("contract_units") or []
-        amount_planned = _sum_units(units, "item_price")    # Сумма 1: без НДС
-        amount_actual = _sum_units(units, "fact_sum")       # Сумма 2: без НДС
-        amount_total = round(amount_planned - amount_actual, 2)
-
         url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
+
+        units = item.get("contract_units") or []
+        amount_planned, amount_actual = _calc_amounts(token, cid, units)
+        amount_total = round(amount_planned - amount_actual, 2)
 
         record = ContractRecord(
             bin=bin_number,
@@ -358,14 +421,13 @@ def scrape_bin(
             url=url,
             error="",
         )
-
         result.records.append(record)
 
         if on_record:
             try:
                 on_record(record)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("on_record callback error: %s", exc)
+            except Exception:
+                pass
 
     return result
 
@@ -376,13 +438,7 @@ def scrape_all(
     on_contract_progress: ProgressCallback | None = None,
     on_record: RecordCallback | None = None,
 ) -> list[ScrapeResult]:
-    """
-    Главная точка входа. Принимает список словарей вида:
-        {"bin": "031240001439", "max_income": 500000000.0}
-    """
-    # Очищаем кэш имён при новом запуске
     _supplier_name_cache.clear()
-
     token = _get_token()
     results: list[ScrapeResult] = []
     total_bins = len(bin_data)
@@ -394,22 +450,20 @@ def scrape_all(
         if on_bin_start:
             try:
                 on_bin_start(i, total_bins, bin_number)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("on_bin_start callback error: %s", exc)
+            except Exception:
+                pass
 
         logger.info("=== Обработка БИН %s (%d/%d) ===", bin_number, i, total_bins)
-        result = scrape_bin(
-            bin_number, max_income, token,
-            on_contract_progress=on_contract_progress,
-            on_record=on_record,
-        )
+        result = scrape_bin(bin_number, max_income, token,
+                            on_contract_progress=on_contract_progress,
+                            on_record=on_record)
         results.append(result)
 
     return results
 
 
 # ---------------------------------------------------------------------------
-# Быстрый ручной тест
+# Тест
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
@@ -429,11 +483,8 @@ if __name__ == "__main__":
     for res in results:
         print(f"\n=== БИН {res.bin}: {len(res.records)} договоров ===")
         for rec in res.records[:5]:
-            print(
-                f"  Компания: {rec.supplier_name or '—'} | "
-                f"№{rec.contract_number} | {rec.description[:50]:50s} "
-                f"| план: {rec.amount_planned:,.0f} | факт: {rec.amount_actual:,.0f} "
-                f"| итого: {rec.amount_total:,.2f} ₸ | макс.доход: {rec.max_income:,.0f}"
-            )
+            print(f"  Компания: {rec.supplier_name or '—'} | №{rec.contract_number} | "
+                  f"план: {rec.amount_planned:,.2f} | факт: {rec.amount_actual:,.2f} | "
+                  f"итого: {rec.amount_total:,.2f} ₸")
         if res.errors:
             print(f"  Ошибок: {len(res.errors)}")
