@@ -49,9 +49,10 @@ MAX_RECORDS = 10_000
 LOT_PAGE_URL_TEMPLATE = "https://goszakup.gov.kz/ru/lots/index/{lot_id}"
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
 
-# Фильтры: статус 210 (Завершено), способы: Открытый конкурс(1), Рейтингово-балльная(32),
+# Фильтры: статус 350 (Договор подписан — только у него заполнен itogiDatePublic),
+# способы: Открытый конкурс(1), Рейтингово-балльная(32),
 # Строительство "под ключ"(188), Предквалификация(201), Предмет: Работа(2)
-TARGET_STATUS_IDS = [210]
+TARGET_STATUS_IDS = [350]
 TARGET_METHOD_IDS = [1, 32, 188, 201]
 TARGET_SUBJECT_TYPE_ID = 2  # Работа
 
@@ -147,11 +148,16 @@ query($filter: ContractFiltersInput) {
 """
 
 _LOTS_LIST_QUERY = """
-query($filter: TrdBuyFiltersInput) {
+query($filter: LotsFiltersInput) {
   Lots(limit: 100, filter: $filter) {
     id
     lotNumber
     nameRu
+    Plans {
+      id
+      plnPointYear
+      sum1
+    }
   }
 }
 """
@@ -511,18 +517,10 @@ def scrape_announcements(
 
         logger.info("Объявление #%s: %s", number_anno, name_ru[:80])
 
-        # Шаг 1: Проверяем наличие договора
-        has_contract = _has_contract(token, number_anno)
-        if has_contract:
-            logger.info("  → договор найден, пропускаем")
-            continue
-
-        logger.info("  → договора нет, проверяем победителя")
-
-        # Шаг 2: Получаем протокол итогов и ищем победителя
+        # Шаг 1: Проверяем победителя (Информация о победителе)
         protocol_url = _get_protocol_url(token, ann_id)
         if not protocol_url:
-            logger.info("  → протокол не найден")
+            logger.info("  → протокол не найден, пропускаем")
             continue
 
         protocol_soup = _download_protocol(token, protocol_url)
@@ -531,18 +529,32 @@ def scrape_announcements(
 
         winner_name, winner_bin = _parse_winner_from_protocol(protocol_soup)
         if not winner_bin:
-            logger.info("  → победитель не найден в протоколе, пропускаем")
+            logger.info("  → победитель не найден, пропускаем")
             continue
 
         logger.info("  → победитель: %s (БИН: %s)", winner_name, winner_bin)
 
-        # Шаг 3: Получаем лоты и сумму 1 год
+        # Шаг 2: Проверяем наличие договора
+        has_contract = _has_contract(token, number_anno)
+        if has_contract:
+            logger.info("  → договор найден, пропускаем")
+            continue
+
+        logger.info("  → договора нет, собираем данные")
+
+        # Шаг 3: Получаем лоты и сумму 1 год из Plans API
         lots = _fetch_lots_for_anno(token, ann_id)
         year1_sum = 0.0
         if lots:
-            lot_id = _to_int(lots[0].get("id"))
-            if lot_id:
-                year1_sum = _fetch_year1_sum(token, lot_id)
+            # Берём sum1 из первого плана первого лота за текущий год
+            for lot in lots:
+                plans = lot.get("Plans") or []
+                for plan in plans:
+                    if plan.get("plnPointYear") == 2026:
+                        s1 = _to_float(plan.get("sum1"))
+                        if s1 > 0:
+                            year1_sum += s1
+            if year1_sum > 0:
                 logger.info("  → Сумма 1 год: %.2f", year1_sum)
 
         record = AnnouncementRecord(
