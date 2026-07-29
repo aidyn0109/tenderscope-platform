@@ -50,10 +50,9 @@ LOT_PAGE_URL_TEMPLATE = "https://goszakup.gov.kz/ru/lots/index/{lot_id}"
 ANNOUNCEMENT_URL_TEMPLATE = "https://goszakup.gov.kz/ru/announce/index/{id}"
 
 # Фильтры: статус 350 (Договор подписан — только у него заполнен itogiDatePublic),
-# способы: Открытый конкурс(1), Рейтингово-балльная(32),
-# Строительство "под ключ"(188), Предквалификация(201), Предмет: Работа(2)
+# способы: Рейтингово-балльная(32), Строительство "под ключ"(188), Предмет: Работа(2)
 TARGET_STATUS_IDS = [350]
-TARGET_METHOD_IDS = [1, 32, 188, 201]
+TARGET_METHOD_IDS = [32, 188]
 TARGET_SUBJECT_TYPE_ID = 2  # Работа
 
 logger = logging.getLogger(__name__)
@@ -80,6 +79,8 @@ class AnnouncementRecord:
 class ScrapeAnnouncementsResult:
     results: list[AnnouncementRecord] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    total_after_filter: int = 0       # всего после фильтрации по датам
+    total_after_algorithm: int = 0    # прошли алгоритм (победитель + нет договора)
 
 
 ProgressCallback = Callable[[int, int, str], None]
@@ -503,6 +504,7 @@ def scrape_announcements(
         logger.warning("Объявления не найдены для диапазона: %s — %s", date_from, date_to)
         return result
 
+    result.total_after_filter = len(items)
     total = len(items)
     for idx, item in enumerate(items, start=1):
         if on_progress:
@@ -574,6 +576,7 @@ def scrape_announcements(
             except Exception:
                 pass
 
+    result.total_after_algorithm = len(result.results)
     return result
 
 

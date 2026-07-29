@@ -41,13 +41,15 @@ def _write_progress(path: str, data: dict) -> None:
         pass
 
 
-def _write_output(path: str, records: list) -> None:
+def _write_output(path: str, records: list, extra: dict | None = None) -> None:
     """Атомарная запись output.json — tmp→rename, чтобы app.py не прочитал обрезанный файл."""
     tmp = path + ".tmp"
     try:
+        data = {"records": records, "error": None}
+        if extra:
+            data.update(extra)
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"records": records, "error": None}, f,
-                      ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
         os.replace(tmp, path)
     except Exception as e:
         log.warning("Ошибка записи output: %s", e)
@@ -130,7 +132,7 @@ def _run(bin_data: list[dict], progress_file: str, output_file: str) -> tuple[li
     return all_records, progress
 
 
-def _run_announcements(date: str, date_to: str, progress_file: str, output_file: str) -> tuple[list[dict], dict]:
+def _run_announcements(date: str, date_to: str, progress_file: str, output_file: str) -> tuple[list[dict], dict, dict]:
     progress = {
         "announcement_current": 0,
         "announcement_total":   0,
@@ -155,7 +157,11 @@ def _run_announcements(date: str, date_to: str, progress_file: str, output_file:
 
     result = scrape_announcements(date, on_progress=on_progress, on_record=on_record, date_to=date_to)
 
-    return all_records, progress
+    extra = {
+        "total_after_filter": result.total_after_filter,
+        "total_after_algorithm": result.total_after_algorithm,
+    }
+    return all_records, progress, extra
 
 
 def main() -> None:
@@ -179,7 +185,7 @@ def main() -> None:
             date = params.get("date")
             date_to = params.get("date_to", date)
             log.info("Парсинг объявлений: %s — %s", date, date_to)
-            records, progress = _run_announcements(date, date_to, progress_file, output_file)
+            records, progress, extra = _run_announcements(date, date_to, progress_file, output_file)
         else:
             # Режим договоров — bins теперь список словарей [{bin, max_income}, ...]
             bin_data = params.get("bins", [])
@@ -190,8 +196,9 @@ def main() -> None:
             log.info("Парсинг договоров для БИН: %s", bin_names)
             records, progress = _run(bin_data, progress_file, output_file)
 
-        # Финальная запись — фиксируем итоговый список (on_record уже писал частично)
-        _write_output(output_file, records)
+        # Финальная запись — фиксируем итоговый список
+        final_extra = extra if mode == "announcements" else None
+        _write_output(output_file, records, final_extra)
         log.info("Результат финализирован: %d записей", len(records))
     except Exception as exc:
         log.exception("Критическая ошибка: %s", exc)

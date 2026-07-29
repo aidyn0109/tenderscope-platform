@@ -547,7 +547,7 @@ if (st.session_state.page == PAGE_ANNOUNCEMENTS
 
         st.caption(
             "Применяются фиксированные фильтры: статус «Договор подписан», предмет «Работа», "
-            "способы закупки «Открытый конкурс», «Рейтингово-балльная», «Строительство под ключ», «Предквалификация»."
+            "способы закупки «Рейтингово-балльная система», «Строительство под ключ»."
         )
 
         st.divider()
@@ -801,6 +801,8 @@ if st.session_state.running:
 
                 results = ScrapeAnnouncementsResult(
                     results=[_deserialize_announcement(r) for r in all_recs],
+                    total_after_filter=data.get("total_after_filter", 0),
+                    total_after_algorithm=data.get("total_after_algorithm", 0),
                 )
                 log.info("Загружено %d объявлений", len(all_recs))
 
@@ -1059,11 +1061,14 @@ if st.session_state.results_announcements is not None and not st.session_state.r
         total_announcements = len(results.results)
         total_errors = len(results.errors)
         total_year1 = sum(r.year1_sum for r in results.results if r.year1_sum > 0)
+        after_filter = getattr(results, "total_after_filter", total_announcements)
+        after_algo = getattr(results, "total_after_algorithm", total_announcements)
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Всего объявлений", total_announcements)
-        c2.metric("Ошибок при сборе", total_errors)
-        c3.metric("Сумма 1 год", f"{total_year1:,.0f} ₸")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("После фильтрации", after_filter)
+        c2.metric("Прошли алгоритм", after_algo)
+        c3.metric("Ошибок", total_errors)
+        c4.metric("Сумма 1 год", f"{total_year1:,.0f} ₸")
         st.divider()
 
         for rec in results.results[:15]:
