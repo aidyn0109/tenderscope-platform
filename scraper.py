@@ -310,19 +310,28 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
 
         max_year = max(by_year.keys())
         plan_sum_v3 = by_year[max_year]["planSum"]
+        fact_sum_all = sum(v["factSum"] for v in by_year.values())
         fact_sum = sum(by_year[fy]["factSum"] for fy in by_year if fy != max_year)
 
-        # Проверка: если v3 planSum меньше item_price_v2 более чем в 10 раз,
-        # используем item_price_v2 как planSum (особый случай: сумма с НДС)
+        # Ситуация 1: factSum по всем годам = 0, но v2 item_price > v3 planSum
+        #   → v2 item_price это реальная "Утвержденная планируемая сумма" (мелкие контракты)
+        if fact_sum == 0.0 and fact_sum_all == 0.0 and item_price_v2 > plan_sum_v3:
+            logger.info(
+                "ContractSpecSum: contract=%d, unit=%d, все factSum=0, v2 item_price=%.2f > v3 planSum=%.2f, "
+                "используем v2 item_price",
+                contract_id, primary_unit_id, item_price_v2, plan_sum_v3,
+            )
+            return item_price_v2, fact_sum
+
+        # Ситуация 2: v3 planSum аномально мал относительно v2 item_price
+        #   → используем item_price как «Сумма по предмету договора (с учетом НДС)»
         if item_price_v2 > 0 and plan_sum_v3 > 0 and item_price_v2 > plan_sum_v3 * 10:
             logger.info(
-                "ContractSpecSum: contract=%d, unit=%d, v3 planSum=%.2f слишком мал, "
-                "используем v2 item_price=%.2f",
+                "ContractSpecSum: contract=%d, unit=%d, v3 planSum=%.2f слишком мал "
+                "(item_price=%.2f), используем v2 item_price",
                 contract_id, primary_unit_id, plan_sum_v3, item_price_v2,
             )
-            plan_sum = item_price_v2
-            # fact_sum остаётся из v3
-            return plan_sum, fact_sum
+            return item_price_v2, fact_sum
 
         logger.info(
             "ContractSpecSum: contract=%d, unit=%d, max_year=%d, planSum=%.2f, factSum=%.2f",
