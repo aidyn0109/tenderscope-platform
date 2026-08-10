@@ -8,11 +8,13 @@ scraper.py — Логика парсинга реестра договоров g
   - crdate: 2026 год — фильтруется в Python
 
 Для каждого договора извлекаются данные из раздела «Предметы договора»:
-  Алгоритм выбора unit:
-    1. Берём первый unit из contract_units (основной предмет договора)
-    2. Всегда через v3 ContractSpecSum:
-       - Сумма 1 = planSum за fin_year контракта (Утвержденная планируемая сумма на текущий год)
-       - Сумма 2 = factSum за fin_year контракта (Сумма предмета договора исполненная, фактическая)
+  Алгоритм:
+    1. Получаем v3 ContractSpecSum → определяем порядок unitId
+    2. Основной предмет договора = ПОСЛЕДНИЙ unitId (куда ведёт ссылка loadunit)
+    3. Агрегируем по годам:
+       - planSum = сумма planSum за максимальный finYear (Утвержденная планируемая сумма)
+       - factSum = сумма factSum за все года КРОМЕ максимального (исполненная, фактическая)
+    4. Если v3 planSum аномально мал — fallback на v2 item_price (сумма с НДС)
 """
 
 import logging
@@ -236,27 +238,28 @@ def _fetch_supplier_name(token: str, bin_number: str) -> str:
 # Выбор правильного unit и расчёт сумм
 # ---------------------------------------------------------------------------
 
-def _pick_first_unit(units: list[dict]) -> dict | None:
-    """Берём первый unit из contract_units — основной предмет договора."""
-    return units[0] if units else None
+def _pick_unit_by_id(units: list[dict], target_unit_id: int) -> dict | None:
+    """Находит unit в списке v2 по unitId."""
+    for u in units:
+        if u.get("id") == target_unit_id:
+            return u
+    return None
 
 
 def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[float, float]:
     """
     Возвращает (amount_planned, amount_actual) для контракта.
-    Использует v3 ContractSpecSum:
-      - amount_planned = сумма planSum за максимальный finYear для первого unitId
-        (Утвержденная планируемая сумма на текущий год)
-      - amount_actual  = сумма factSum за все года КРОМЕ максимального для первого unitId
-        (Сумма предмета договора исполненная, фактическая)
+    Алгоритм:
+      1. Получаем v3 ContractSpecSum
+      2. Берём ПОСЛЕДНИЙ уникальный unitId — основной предмет договора
+      3. Агрегируем по годам:
+         - planSum = сумма planSum за максимальный finYear
+         - factSum = сумма factSum за все года КРОМЕ максимального
+      4. Если planSum из v3 выглядит неправильно (слишком мал) —
+         используем item_price из v2 (Сумма по предмету договора с НДС)
     """
-    unit = _pick_first_unit(units)
-    if not unit:
-        return 0.0, 0.0
-
-    unit_id = unit.get("id")
-    if not unit_id or not contract_id:
-        logger.warning("Нет unit_id или contract_id")
+    if not units or not contract_id:
+        logger.warning("Нет units или contract_id")
         return 0.0, 0.0
 
     try:
@@ -267,34 +270,65 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
             return 0.0, 0.0
 
         spec_sums = ob.get("ContractSpecSum") or []
-
-        # Группируем по unitId + finYear
-        by_unit_year: dict[int, dict[int, dict[str, float]]] = {}
-        for ss in spec_sums:
-            uid = ss.get("unitId")
-            fy = ss.get("finYear")
-            if uid not in by_unit_year:
-                by_unit_year[uid] = {}
-            if fy not in by_unit_year[uid]:
-                by_unit_year[uid][fy] = {"planSum": 0.0, "factSum": 0.0}
-            by_unit_year[uid][fy]["planSum"] += _to_float(ss.get("planSum"))
-            by_unit_year[uid][fy]["factSum"] += _to_float(ss.get("factSum"))
-
-        if unit_id not in by_unit_year:
-            logger.warning("ContractSpecSum: unitId=%d не найден в v3", unit_id)
+        if not spec_sums:
+            logger.warning("ContractSpecSum: нет данных для contract=%d", contract_id)
             return 0.0, 0.0
 
-        unit_data = by_unit_year[unit_id]
-        max_year = max(unit_data.keys())
+        # Определяем порядок уникальных unitId
+        unit_order: list[int] = []
+        seen: set[int] = set()
+        for ss in spec_sums:
+            uid = ss.get("unitId")
+            if uid not in seen:
+                unit_order.append(uid)
+                seen.add(uid)
 
-        plan_sum = unit_data[max_year]["planSum"]
-        fact_sum = sum(unit_data[fy]["factSum"] for fy in unit_data if fy != max_year)
+        if not unit_order:
+            return 0.0, 0.0
+
+        # Основной предмет договора — ПОСЛЕДНИЙ unitId
+        primary_unit_id = unit_order[-1]
+
+        # Находим этот unit в v2
+        unit = _pick_unit_by_id(units, primary_unit_id)
+        item_price_v2 = _to_float(unit.get("item_price")) if unit else 0.0
+
+        # Группируем v3 данные по годам для primary_unit_id
+        by_year: dict[int, dict[str, float]] = {}
+        for ss in spec_sums:
+            if ss.get("unitId") != primary_unit_id:
+                continue
+            fy = ss.get("finYear")
+            if fy not in by_year:
+                by_year[fy] = {"planSum": 0.0, "factSum": 0.0}
+            by_year[fy]["planSum"] += _to_float(ss.get("planSum"))
+            by_year[fy]["factSum"] += _to_float(ss.get("factSum"))
+
+        if not by_year:
+            logger.warning("ContractSpecSum: unitId=%d не найден в v3 данных", primary_unit_id)
+            return 0.0, 0.0
+
+        max_year = max(by_year.keys())
+        plan_sum_v3 = by_year[max_year]["planSum"]
+        fact_sum = sum(by_year[fy]["factSum"] for fy in by_year if fy != max_year)
+
+        # Проверка: если v3 planSum меньше item_price_v2 более чем в 10 раз,
+        # используем item_price_v2 как planSum (особый случай: сумма с НДС)
+        if item_price_v2 > 0 and plan_sum_v3 > 0 and item_price_v2 > plan_sum_v3 * 10:
+            logger.info(
+                "ContractSpecSum: contract=%d, unit=%d, v3 planSum=%.2f слишком мал, "
+                "используем v2 item_price=%.2f",
+                contract_id, primary_unit_id, plan_sum_v3, item_price_v2,
+            )
+            plan_sum = item_price_v2
+            # fact_sum остаётся из v3
+            return plan_sum, fact_sum
 
         logger.info(
             "ContractSpecSum: contract=%d, unit=%d, max_year=%d, planSum=%.2f, factSum=%.2f",
-            contract_id, unit_id, max_year, plan_sum, fact_sum,
+            contract_id, primary_unit_id, max_year, plan_sum_v3, fact_sum,
         )
-        return plan_sum, fact_sum
+        return plan_sum_v3, fact_sum
 
     except Exception as exc:
         logger.warning("Ошибка v3 ContractSpecSum для contract=%d: %s", contract_id, exc)
