@@ -238,11 +238,10 @@ def _fetch_supplier_name(token: str, bin_number: str) -> str:
 # Выбор правильного unit и расчёт сумм
 # ---------------------------------------------------------------------------
 
-def _pick_unit_by_id(units: list[dict], target_unit_id: int) -> dict | None:
-    """Находит unit в списке v2 по unitId."""
-    for u in units:
-        if u.get("id") == target_unit_id:
-            return u
+def _get_unit_by_index(units: list[dict], index: int) -> dict | None:
+    """Получает unit из v2 по индексу (0 = первый)."""
+    if 0 <= index < len(units):
+        return units[index]
     return None
 
 
@@ -289,8 +288,10 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
         # Основной предмет договора — ПОСЛЕДНИЙ unitId
         primary_unit_id = unit_order[-1]
 
-        # Находим этот unit в v2
-        unit = _pick_unit_by_id(units, primary_unit_id)
+        # Находим соответствующий unit в v2 по индексу
+        # v2 и v3 возвращают unit'ы в одинаковом порядке
+        unit_index = len(unit_order) - 1  # индекс последнего unitId
+        unit = _get_unit_by_index(units, unit_index)
         item_price_v2 = _to_float(unit.get("item_price")) if unit else 0.0
 
         # Группируем v3 данные по годам для primary_unit_id
@@ -311,23 +312,18 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
         max_year = max(by_year.keys())
         plan_sum_v3 = by_year[max_year]["planSum"]
 
-        # factSum: сумма factSum за года где planSum совпадает с plan_sum_v3,
-        # КРОМЕ максимального года (чтобы исключить сумму с отличающимся планом)
-        fact_sum = sum(
-            by_year[fy]["factSum"]
-            for fy in by_year
-            if fy != max_year and abs(by_year[fy]["planSum"] - plan_sum_v3) < 0.01
-        )
+        # factSum: сумма factSum за все года КРОМЕ максимального
+        fact_sum = sum(by_year[fy]["factSum"] for fy in by_year if fy != max_year)
         plan_sum = plan_sum_v3
 
-        # Особый случай: v3 planSum аномально мал относительно item_price первого unit
-        # (страницы типа units/24782423 где "Сумма по предмету договора (с учетом НДС)")
-        if units:
+        # Особый случай: v3 planSum аномально мал, а factSum ≈ planSum
+        # (страницы типа units/24782423 где показывается "Сумма по предмету договора с НДС")
+        if units and plan_sum_v3 > 0 and abs(plan_sum_v3 - fact_sum) < 1.0:
             first_unit_price = _to_float(units[0].get("item_price"))
-            if first_unit_price > 0 and plan_sum_v3 > 0 and first_unit_price > plan_sum_v3 * 10:
+            if first_unit_price > plan_sum_v3 * 10:
                 plan_sum = first_unit_price
                 logger.info(
-                    "ContractSpecSum: contract=%d, v3 planSum=%.2f слишком мал, "
+                    "ContractSpecSum: contract=%d, v3 planSum=factSum=%.2f аномально мал, "
                     "используем item_price первого unit=%.2f",
                     contract_id, plan_sum_v3, first_unit_price,
                 )
