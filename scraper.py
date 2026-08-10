@@ -310,34 +310,26 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
 
         max_year = max(by_year.keys())
         plan_sum_v3 = by_year[max_year]["planSum"]
-        fact_sum_all = sum(v["factSum"] for v in by_year.values())
+
+        # factSum: сумма factSum за все года КРОМЕ максимального
         fact_sum = sum(by_year[fy]["factSum"] for fy in by_year if fy != max_year)
 
-        # Ситуация 1: factSum по всем годам = 0, но v2 item_price > v3 planSum
-        #   → v2 item_price это реальная "Утвержденная планируемая сумма" (мелкие контракты)
-        if fact_sum == 0.0 and fact_sum_all == 0.0 and item_price_v2 > plan_sum_v3:
+        # Определяем итоговый planSum
+        # Если item_price_v2 > plan_sum_v3 — v2 содержит более точное значение для мелких сумм
+        if item_price_v2 > 0 and item_price_v2 > plan_sum_v3:
+            plan_sum = item_price_v2
             logger.info(
-                "ContractSpecSum: contract=%d, unit=%d, все factSum=0, v2 item_price=%.2f > v3 planSum=%.2f, "
-                "используем v2 item_price",
+                "ContractSpecSum: contract=%d, unit=%d, v2 item_price=%.2f > v3 planSum=%.2f, используем v2",
                 contract_id, primary_unit_id, item_price_v2, plan_sum_v3,
             )
-            return item_price_v2, fact_sum
-
-        # Ситуация 2: v3 planSum аномально мал относительно v2 item_price
-        #   → используем item_price как «Сумма по предмету договора (с учетом НДС)»
-        if item_price_v2 > 0 and plan_sum_v3 > 0 and item_price_v2 > plan_sum_v3 * 10:
-            logger.info(
-                "ContractSpecSum: contract=%d, unit=%d, v3 planSum=%.2f слишком мал "
-                "(item_price=%.2f), используем v2 item_price",
-                contract_id, primary_unit_id, plan_sum_v3, item_price_v2,
-            )
-            return item_price_v2, fact_sum
+        else:
+            plan_sum = plan_sum_v3
 
         logger.info(
             "ContractSpecSum: contract=%d, unit=%d, max_year=%d, planSum=%.2f, factSum=%.2f",
-            contract_id, primary_unit_id, max_year, plan_sum_v3, fact_sum,
+            contract_id, primary_unit_id, max_year, plan_sum, fact_sum,
         )
-        return plan_sum_v3, fact_sum
+        return plan_sum, fact_sum
 
     except Exception as exc:
         logger.warning("Ошибка v3 ContractSpecSum для contract=%d: %s", contract_id, exc)
