@@ -288,10 +288,9 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
         # Основной предмет договора — ПОСЛЕДНИЙ unitId
         primary_unit_id = unit_order[-1]
 
-        # Находим соответствующий unit в v2 по индексу
-        # v2 и v3 возвращают unit'ы в одинаковом порядке
-        unit_index = len(unit_order) - 1  # индекс последнего unitId
-        unit = _get_unit_by_index(units, unit_index)
+        # Находим соответствующий unit в v2 — последний в списке
+        unit_index = len(units) - 1
+        unit = _get_unit_by_index(units, unit_index) if unit_index >= 0 else None
         item_price_v2 = _to_float(unit.get("item_price")) if unit else 0.0
 
         # Группируем v3 данные по годам для primary_unit_id
