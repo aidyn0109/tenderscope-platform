@@ -9,13 +9,10 @@ scraper.py — Логика парсинга реестра договоров g
 
 Для каждого договора извлекаются данные из раздела «Предметы договора»:
   Алгоритм выбора unit:
-    1. Из всех contract_units выбираем unit с минимальным item_price (> 0)
-    2. Если fact_sum > 0 → Сценарий 1 (обычный):
-       - Сумма 1 = item_price (Сумма по предмету договора без НДС)
-       - Сумма 2 = fact_sum (Сумма исполненная, фактическая)
-    3. Если fact_sum == 0 → Сценарий 2 (v3 ContractSpecSum):
-       - Сумма 1 = planSum за текущий год (Утвержденная планируемая сумма)
-       - Сумма 2 = factSum за текущий год
+    1. Берём первый unit из contract_units (основной предмет договора)
+    2. Всегда через v3 ContractSpecSum:
+       - Сумма 1 = planSum за fin_year контракта (Утвержденная планируемая сумма на текущий год)
+       - Сумма 2 = factSum за fin_year контракта (Сумма предмета договора исполненная, фактическая)
 """
 
 import logging
@@ -239,75 +236,66 @@ def _fetch_supplier_name(token: str, bin_number: str) -> str:
 # Выбор правильного unit и расчёт сумм
 # ---------------------------------------------------------------------------
 
-def _pick_best_unit(units: list[dict]) -> dict | None:
-    """
-    Из всех contract_units выбирает правильный unit:
-    — с минимальным item_price (> 0), так как основной предмет договора
-      имеет меньшую стоимость чем общая сумма контракта.
-    """
-    positive = [u for u in units if _to_float(u.get("item_price")) > 0]
-    if not positive:
-        return units[0] if units else None
-    return min(positive, key=lambda u: _to_float(u.get("item_price")))
+def _pick_first_unit(units: list[dict]) -> dict | None:
+    """Берём первый unit из contract_units — основной предмет договора."""
+    return units[0] if units else None
 
 
-def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[float, float]:
+def _calc_amounts(token: str, contract_id: int, units: list[dict], fin_year: int | None = None) -> tuple[float, float]:
     """
     Возвращает (amount_planned, amount_actual) для контракта.
-    Сценарий 1: unit.fact_sum > 0 → item_price / fact_sum
-    Сценарий 2: unit.fact_sum == 0 → ContractSpecSum planSum/factSum за TARGET_YEAR
+    Всегда использует v3 ContractSpecSum:
+      - amount_planned = planSum за fin_year (Утвержденная планируемая сумма на текущий год)
+      - amount_actual  = factSum за fin_year (Сумма предмета договора исполненная, фактическая)
     """
-    unit = _pick_best_unit(units)
+    unit = _pick_first_unit(units)
     if not unit:
         return 0.0, 0.0
 
-    fact_sum = _to_float(unit.get("fact_sum"))
-    item_price = _to_float(unit.get("item_price"))
-
-    if fact_sum > 0:
-        # Сценарий 1: обычная таблица view-subject
-        return item_price, fact_sum
-
-    # Сценарий 2: нужно через v3 ContractSpecSum
     unit_id = unit.get("id")
     if not unit_id or not contract_id:
-        logger.warning("Нет unit_id или contract_id для сценария 2")
-        return item_price, fact_sum
+        logger.warning("Нет unit_id или contract_id")
+        return 0.0, 0.0
+
+    effective_year = fin_year if fin_year is not None else TARGET_YEAR
 
     try:
         resp = _v3_request(token, _SPECSUM_QUERY, {"f": {"id": [contract_id]}})
         ob = ((resp.get("data") or {}).get("ObContract") or [None])[0]
         if not ob:
-            return item_price, fact_sum
+            logger.warning("ContractSpecSum: пустой ответ для contract=%d", contract_id)
+            return 0.0, 0.0
 
         spec_sums = ob.get("ContractSpecSum") or []
-        # Фильтруем: unitId совпадает + finYear == TARGET_YEAR
+        # Фильтруем: unitId совпадает + finYear == effective_year
         year_specs = [
             ss for ss in spec_sums
-            if ss.get("unitId") == unit_id and ss.get("finYear") == TARGET_YEAR
+            if ss.get("unitId") == unit_id and ss.get("finYear") == effective_year
         ]
         if year_specs:
             ss = year_specs[0]
             plan_sum = _to_float(ss.get("planSum"))
             spec_fact = _to_float(ss.get("factSum"))
             logger.info(
-                "Сценарий 2 (ContractSpecSum): unit=%d, year=%d, planSum=%.2f, factSum=%.2f",
-                unit_id, TARGET_YEAR, plan_sum, spec_fact,
+                "ContractSpecSum: unit=%d, year=%d, planSum=%.2f, factSum=%.2f",
+                unit_id, effective_year, plan_sum, spec_fact,
             )
             return plan_sum, spec_fact
 
-        # Fallback: если нет за текущий год — суммируем все года для этого unit
+        # Fallback: если нет за нужный год — суммируем все года для этого unit
         all_for_unit = [ss for ss in spec_sums if ss.get("unitId") == unit_id]
         if all_for_unit:
             total_plan = sum(_to_float(ss.get("planSum")) for ss in all_for_unit)
             total_fact = sum(_to_float(ss.get("factSum")) for ss in all_for_unit)
-            logger.info("Сценарий 2 (fallback): unit=%d, total planSum=%.2f", unit_id, total_plan)
+            logger.info("ContractSpecSum (fallback): unit=%d, total planSum=%.2f", unit_id, total_plan)
             return total_plan, total_fact
+
+        logger.warning("ContractSpecSum: нет данных для unit=%d, year=%d", unit_id, effective_year)
 
     except Exception as exc:
         logger.warning("Ошибка v3 ContractSpecSum для contract=%d: %s", contract_id, exc)
 
-    return item_price, fact_sum
+    return 0.0, 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -405,7 +393,8 @@ def scrape_bin(
         url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
 
         units = item.get("contract_units") or []
-        amount_planned, amount_actual = _calc_amounts(token, cid, units)
+        fin_year = item.get("fin_year")
+        amount_planned, amount_actual = _calc_amounts(token, cid, units, fin_year=fin_year)
         amount_total = round(amount_planned - amount_actual, 2)
 
         record = ContractRecord(
