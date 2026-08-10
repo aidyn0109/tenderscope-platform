@@ -241,12 +241,14 @@ def _pick_first_unit(units: list[dict]) -> dict | None:
     return units[0] if units else None
 
 
-def _calc_amounts(token: str, contract_id: int, units: list[dict], fin_year: int | None = None) -> tuple[float, float]:
+def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[float, float]:
     """
     Возвращает (amount_planned, amount_actual) для контракта.
-    Всегда использует v3 ContractSpecSum:
-      - amount_planned = planSum за fin_year (Утвержденная планируемая сумма на текущий год)
-      - amount_actual  = factSum за fin_year (Сумма предмета договора исполненная, фактическая)
+    Использует v3 ContractSpecSum:
+      - amount_planned = сумма planSum за максимальный finYear для первого unitId
+        (Утвержденная планируемая сумма на текущий год)
+      - amount_actual  = сумма factSum за все года КРОМЕ максимального для первого unitId
+        (Сумма предмета договора исполненная, фактическая)
     """
     unit = _pick_first_unit(units)
     if not unit:
@@ -257,8 +259,6 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict], fin_year: int
         logger.warning("Нет unit_id или contract_id")
         return 0.0, 0.0
 
-    effective_year = fin_year if fin_year is not None else TARGET_YEAR
-
     try:
         resp = _v3_request(token, _SPECSUM_QUERY, {"f": {"id": [contract_id]}})
         ob = ((resp.get("data") or {}).get("ObContract") or [None])[0]
@@ -267,30 +267,34 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict], fin_year: int
             return 0.0, 0.0
 
         spec_sums = ob.get("ContractSpecSum") or []
-        # Фильтруем: unitId совпадает + finYear == effective_year
-        year_specs = [
-            ss for ss in spec_sums
-            if ss.get("unitId") == unit_id and ss.get("finYear") == effective_year
-        ]
-        if year_specs:
-            ss = year_specs[0]
-            plan_sum = _to_float(ss.get("planSum"))
-            spec_fact = _to_float(ss.get("factSum"))
-            logger.info(
-                "ContractSpecSum: unit=%d, year=%d, planSum=%.2f, factSum=%.2f",
-                unit_id, effective_year, plan_sum, spec_fact,
-            )
-            return plan_sum, spec_fact
 
-        # Fallback: если нет за нужный год — суммируем все года для этого unit
-        all_for_unit = [ss for ss in spec_sums if ss.get("unitId") == unit_id]
-        if all_for_unit:
-            total_plan = sum(_to_float(ss.get("planSum")) for ss in all_for_unit)
-            total_fact = sum(_to_float(ss.get("factSum")) for ss in all_for_unit)
-            logger.info("ContractSpecSum (fallback): unit=%d, total planSum=%.2f", unit_id, total_plan)
-            return total_plan, total_fact
+        # Группируем по unitId + finYear
+        by_unit_year: dict[int, dict[int, dict[str, float]]] = {}
+        for ss in spec_sums:
+            uid = ss.get("unitId")
+            fy = ss.get("finYear")
+            if uid not in by_unit_year:
+                by_unit_year[uid] = {}
+            if fy not in by_unit_year[uid]:
+                by_unit_year[uid][fy] = {"planSum": 0.0, "factSum": 0.0}
+            by_unit_year[uid][fy]["planSum"] += _to_float(ss.get("planSum"))
+            by_unit_year[uid][fy]["factSum"] += _to_float(ss.get("factSum"))
 
-        logger.warning("ContractSpecSum: нет данных для unit=%d, year=%d", unit_id, effective_year)
+        if unit_id not in by_unit_year:
+            logger.warning("ContractSpecSum: unitId=%d не найден в v3", unit_id)
+            return 0.0, 0.0
+
+        unit_data = by_unit_year[unit_id]
+        max_year = max(unit_data.keys())
+
+        plan_sum = unit_data[max_year]["planSum"]
+        fact_sum = sum(unit_data[fy]["factSum"] for fy in unit_data if fy != max_year)
+
+        logger.info(
+            "ContractSpecSum: contract=%d, unit=%d, max_year=%d, planSum=%.2f, factSum=%.2f",
+            contract_id, unit_id, max_year, plan_sum, fact_sum,
+        )
+        return plan_sum, fact_sum
 
     except Exception as exc:
         logger.warning("Ошибка v3 ContractSpecSum для contract=%d: %s", contract_id, exc)
@@ -393,8 +397,7 @@ def scrape_bin(
         url = CONTRACT_URL_TEMPLATE.format(id=cid) if cid is not None else ""
 
         units = item.get("contract_units") or []
-        fin_year = item.get("fin_year")
-        amount_planned, amount_actual = _calc_amounts(token, cid, units, fin_year=fin_year)
+        amount_planned, amount_actual = _calc_amounts(token, cid, units)
         amount_total = round(amount_planned - amount_actual, 2)
 
         record = ContractRecord(
