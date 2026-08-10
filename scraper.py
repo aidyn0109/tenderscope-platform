@@ -311,18 +311,20 @@ def _calc_amounts(token: str, contract_id: int, units: list[dict]) -> tuple[floa
         max_year = max(by_year.keys())
         plan_sum_v3 = by_year[max_year]["planSum"]
 
-        # factSum: сумма factSum за все года КРОМЕ максимального
-        fact_sum = sum(by_year[fy]["factSum"] for fy in by_year if fy != max_year)
+        # factSum: сумма factSum за года где planSum совпадает с plan_sum_v3,
+        # КРОМЕ максимального года (чтобы исключить сумму с отличающимся планом)
+        fact_sum = sum(
+            by_year[fy]["factSum"]
+            for fy in by_year
+            if fy != max_year and abs(by_year[fy]["planSum"] - plan_sum_v3) < 0.01
+        )
         plan_sum = plan_sum_v3
 
-        # Особый случай: v3 planSum аномально мал, а item_price первого unit
-        # (полная сумма договора с НДС) содержит правильное значение
-        # (пример: контракт 24782423, план 9.16 млрд, v3 даёт 479 млн)
-        if item_price_v2 > 0 and plan_sum_v3 > 0 and item_price_v2 > plan_sum_v3 * 10:
-            first_unit_price = _to_float(units[0].get("item_price")) if units else 0.0
-            # Используем first_unit_price только если он отличается от item_price_v2
-            # (т.е. это действительно другой unit, а не тот же самый)
-            if first_unit_price > plan_sum_v3 * 10 and abs(first_unit_price - item_price_v2) > 1.0:
+        # Особый случай: v3 planSum аномально мал относительно item_price первого unit
+        # (страницы типа units/24782423 где "Сумма по предмету договора (с учетом НДС)")
+        if units:
+            first_unit_price = _to_float(units[0].get("item_price"))
+            if first_unit_price > 0 and plan_sum_v3 > 0 and first_unit_price > plan_sum_v3 * 10:
                 plan_sum = first_unit_price
                 logger.info(
                     "ContractSpecSum: contract=%d, v3 planSum=%.2f слишком мал, "
