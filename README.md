@@ -61,7 +61,6 @@ TenderScope/
 ├── excel_export_announcements.py   # Режим 2: лист «Объявления»
 │
 ├── requirements.txt
-├── Dockerfile
 ├── render.yaml
 └── CLAUDE.md                       # Рабочие заметки по проекту
 ```
@@ -144,7 +143,9 @@ python scraper_announcements.py 2026-07-04 2026-07-28
 
 ## Деплой на Render
 
-Сервис описан в [render.yaml](render.yaml) и собирается по [Dockerfile](Dockerfile) (`runtime: docker`, порт 8501).
+Сервис описан в [render.yaml](render.yaml): нативный Python-runtime, сборка `pip install -r requirements.txt`, запуск `streamlit run app.py --server.port $PORT --server.address 0.0.0.0`.
+
+> Если сервис на Render был создан вручную через дашборд, а не через Blueprint, `render.yaml` игнорируется — Build/Start Command в этом случае задаются в настройках сервиса и должны совпадать с указанными выше.
 
 Переменные окружения задаются в разделе Render → Environment; они же служат заменой `secrets.toml`:
 
